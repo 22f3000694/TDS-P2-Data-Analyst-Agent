@@ -18,7 +18,9 @@ contourpy
 cycler
 distro
 duckdb
-fastapi
+httpcore==1.0.4
+requests==2.31.0
+fastapi==0.110.0
 fonttools
 frozenlist
 fsspec
@@ -34,7 +36,6 @@ googleapis-common-protos
 grpcio
 grpcio-status
 h11
-httpcore
 httplib2
 httpx
 idna
@@ -69,7 +70,6 @@ python-dateutil
 python-multipart
 pytz
 referencing
-requests
 rpds-py
 rsa
 s3fs
