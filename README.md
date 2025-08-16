@@ -1,126 +1,114 @@
-# Read this file everything will happen on its own.
+# Data Analyst FastAPI Application
 
-`Note: try to use linux distro or install WSL(subsystem for linux) on windows.`
+A powerful FastAPI application for data analysis with multiple LLM integrations, web scraping capabilities, and OCR functionality.
 
-## 🚀 Features
-- Automatically installs dependencies from `requirements.txt`
-- Installs ngrok if not already installed
-- Starts `uvicorn` server
-- Exposes your local server publicly via ngrok
-- Clean shutdown with **Ctrl+C**
----
+## Features
 
-## 📦 Prerequisites
-Make sure you have:
-- **Python 3.8+** installed
-- **pip** installed
+- **Multiple LLM Support**: Gemini 2.0 Flash, Gemini 2.5 Pro, GPT-4o Mini, Horizon Beta
+- **Web Scraping**: Playwright-based scraping with stealth capabilities
+- **OCR Processing**: Image text extraction using OCR.space API
+- **Data Analysis**: Pandas, NumPy, DuckDB for data processing
+- **File Processing**: Support for CSV, Excel, PDF, images, and archives
 
----
+## Quick Start
 
+### Local Development
 
-## 🔑 Getting Credentials
-1. **Google API Key**  
-   Get your key here:  
-   [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
-
-2. **ngrok Auth Token**  
-   Register and get your token here:  
-   [https://ngrok.com/](https://ngrok.com/)
-
-   ## ONLY COPY SELECTED PART
-   ![ngrog screenshot](photos/ngrok_ss.png)
-
----
-
-
-## 🛠️ Installation: Just execute this file and enter your credentials
-
-### 1. Make the script executable
+1. Clone the repository:
 ```bash
-chmod +x start.sh
+git clone <your-repo-url>
+cd dataanalyst-main
 ```
 
-### 2. Then run the script 
+2. Create virtual environment:
 ```bash
-./start.sh
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+playwright install
+```
 
----
+4. Set up environment variables:
+```bash
+cp .env.example .env
+# Edit .env with your API keys
+```
 
-# Lastly copy paste the public url
-Also don't forgot to add "/api" after the url.
+5. Run the application:
+```bash
+python app.py
+```
 
-- ### public link
+The API will be available at `http://localhost:8000` with docs at `http://localhost:8000/docs`
 
-eg: https://dd0b98d2abc3.ngrok-free.app
-![public link](photos/final_public_link.png)
+### Required API Keys
 
-- ### Add "/api"
+Create a `.env` file with the following keys:
 
-## Final link: public link + "/api"
+```env
+# Essential APIs
+gemini_api=your_google_gemini_api_key_here
+gemini_api_2=your_second_gemini_api_key_here
+API_KEY=your_openai_compatible_api_key_here
+horizon_api=your_openrouter_api_key_here
 
-eg:  https://dd0b98d2abc3.ngrok-free.app/api
+# Optional APIs
+OCR_API_KEY=your_ocr_space_api_key_here
+grok_api=your_grok_api_key_here
+grok_fix_api=your_grok_fix_api_key_here
+```
 
-## Environment Variables Setup
+### How to get API Keys
 
-This project loads environment variables from a file named `env_variables.txt` located in the project root.
+1. **Google Gemini**: [Google AI Studio](https://makersuite.google.com/app/apikey)
+2. **OpenAI**: [OpenAI Platform](https://platform.openai.com/api-keys)
+3. **OpenRouter**: [OpenRouter](https://openrouter.ai/)
+4. **OCR.space**: [OCR.space](https://ocr.space/ocrapi)
 
-**How to use:**
+## Railway Deployment
 
-1. Create a file called `env_variables.txt` in the project directory.
-2. Add your variables in the format:
-   ```
-   GENAI_API_KEY=your_google_api_key
-   NGROK_AUTHTOKEN=your_ngrok_authtoken
-   # You can add more variables as needed
-   ```
-3. When you run `start.sh`, these variables will be automatically loaded and exported to your environment.
+This app is configured for Railway deployment:
 
+1. **Connect to Railway**:
+   - Go to [Railway](https://railway.app)
+   - Connect your GitHub repository
+   - Select this repository
 
+2. **Set Environment Variables**:
+   - Add all required API keys in Railway dashboard
+   - Railway will automatically detect the Python app
 
-# Testing
-## 🌐 Using the Frontend
+3. **Deploy**:
+   - Railway will automatically build and deploy
+   - Your app will be available at the generated Railway URL
 
-A simple HTML frontend is provided for uploading multiple files and viewing API responses.
+## Models Used
 
-### How to use:
+- **Gemini 2.0 Flash**: Fast data extraction and task breaking
+- **Gemini 2.5 Pro**: Advanced code generation and fixing
+- **GPT-4o Mini**: Cost-effective text generation
+- **Horizon Beta**: Alternative model via OpenRouter
 
-1. Make sure your FastAPI server is running and accessible (e.g., via ngrok).
-2. Open `https://xxxxxx.ngrok-free.app` in your browser.
-3. Click the "Choose Files" button and select one or more files.
-4. Click "Submit" to upload the files(you can select multiple files) to the backend.
-5. The response from the API will be displayed below the form.
+## API Endpoints
 
-![Frontend photo](photos/Frontend.png)
+- `GET /`: Health check
+- `POST /analyze`: Main data analysis endpoint
+- `POST /upload`: File upload and processing
+- `GET /docs`: Interactive API documentation
 
-**Note:**  
-- The frontend sends files to the `/api` endpoint of your public URL.
-- You can preview selected file names before uploading.
+## Tech Stack
 
----
+- **FastAPI**: Modern web framework
+- **Playwright**: Web scraping
+- **Pandas/NumPy**: Data processing
+- **DuckDB**: Fast analytical database
+- **Matplotlib/Seaborn**: Data visualization
+- **Multiple LLMs**: AI-powered analysis
 
-### Troubleshooting
+## License
 
-- If you see "No response yet" or an error, check that your FastAPI server is running and accessible.
-- Make sure the public URL matches your ngrok tunnel and ends with `/api` for direct API
-
-
-# Common Issues
-
-1. ### Uvicorn Server Shutdown Issues
-
-**Note:**  
-Sometimes, pressing **Ctrl+C** does not fully stop the Uvicorn server. This can lead to "Internal Server Error" or port conflicts when you try to restart the server.
-
-**What to do:**  
-- If you still see errors after stopping the script, manually kill any running Uvicorn processes:
-  ```bash
-  pkill -f uvicorn
-  ```
-- Alternatively, you can restart your terminal or system to ensure all processes are stopped.
-
-**Tip:**  
-Always make sure no old Uvicorn processes are running before starting the
-
-![Uvicorn server stopping](photos/uvicorn_server_stoping.png)
+See LICENSE file for details.
