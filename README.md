@@ -1,114 +1,130 @@
-# Data Analyst FastAPI Application
+# ⚡ Data Analyst Agent — Your AI-Powered Data Companion  
+> Smarter, faster, and more intuitive analysis of your datasets using **Generative AI + Python magic.**  
+> Repository: *Insert your GitHub repo link here*
 
-A powerful FastAPI application for data analysis with multiple LLM integrations, web scraping capabilities, and OCR functionality.
+---
 
-## Features
+## 📌 What Is This?
+Meet **Data Analyst Agent 2.0** — an AI-driven assistant that eliminates tedious data crunching.  
+Upload your dataset + queries, and instantly get:  
+✅ Visual reports  
+✅ AI-generated insights  
+✅ Automated workflows  
 
-- **Multiple LLM Support**: Gemini 2.0 Flash, Gemini 2.5 Pro, GPT-4o Mini, Horizon Beta
-- **Web Scraping**: Playwright-based scraping with stealth capabilities
-- **OCR Processing**: Image text extraction using OCR.space API
-- **Data Analysis**: Pandas, NumPy, DuckDB for data processing
-- **File Processing**: Support for CSV, Excel, PDF, images, and archives
+Perfect for:  
+- Analysts 🧾  
+- Researchers 🔬  
+- Startups & Businesses 📈  
+- Anyone who loves turning raw data into knowledge  
 
-## Quick Start
+---
 
-### Local Development
+## ✨ Key Highlights  
 
-1. Clone the repository:
-```bash
-git clone <your-repo-url>
-cd dataanalyst-main
-```
+| Feature                  | Why It’s Awesome 🚀 |
+|---------------------------|----------------------|
+| 🤖 AI-Powered Insights    | Uses Google’s Generative AI to “understand” your data |
+| 📊 Rich Visualizations    | Generates plots with **Seaborn & Matplotlib** |
+| 🌍 Web Scraper Mode       | Fetch live data directly from URLs |
+| 📂 Multi-Format Friendly  | Accepts CSV, Excel, JSON, Parquet, or TXT |
+| 🔄 Ask Many at Once       | Batch processing for multiple questions |
+| 🖥️ Simple-to-Use Interface | Beginner friendly, no steep learning curve |
+| ⚡ Super-Fast Execution   | Optimized for speed + real-time feedback |
 
-2. Create virtual environment:
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
+---
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-playwright install
-```
+## 🚀 Getting Started  
 
-4. Set up environment variables:
-```bash
-cp .env.example .env
-# Edit .env with your API keys
-```
+### 1️⃣ Clone the Repo  - git clone https://github.com/your-username/data-analyst-agent.git
+cd data-analyst-agent
 
-5. Run the application:
-```bash
-python app.py
-```
+### 2️⃣ Install Requirements  - pip install -r requirements.txt
 
-The API will be available at `http://localhost:8000` with docs at `http://localhost:8000/docs`
+### 3️⃣ Configure API Keys  
+Create a `.env` file inside the root folder:  
+GEMINI_API_KEY=your_google_api_key
+LLM_TIMEOUT_SECONDS=240
 
-### Required API Keys
 
-Create a `.env` file with the following keys:
+### 4️⃣ Start the Application  - python -m uvicorn app:app --reload
 
-```env
-# Essential APIs
-gemini_api=your_google_gemini_api_key_here
-gemini_api_2=your_second_gemini_api_key_here
-API_KEY=your_openai_compatible_api_key_here
-horizon_api=your_openrouter_api_key_here
+Now open [**http://localhost:8000/**](http://localhost:8000/) in your browser 🌐  
 
-# Optional APIs
-OCR_API_KEY=your_ocr_space_api_key_here
-grok_api=your_grok_api_key_here
-grok_fix_api=your_grok_fix_api_key_here
-```
+## 🧑‍💻 How It Works  
 
-### How to get API Keys
+1. **Write Your Questions**  
+   Create a `.txt` file with queries like:  What’s the revenue growth month-over-month?, Find correlation between Age and Income, Show most profitable products...etc
 
-1. **Google Gemini**: [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. **OpenAI**: [OpenAI Platform](https://platform.openai.com/api-keys)
-3. **OpenRouter**: [OpenRouter](https://openrouter.ai/)
-4. **OCR.space**: [OCR.space](https://ocr.space/ocrapi)
+2. **Upload Dataset + Questions File**  
+- Dataset (optional) → CSV, Excel, JSON, Parquet, or TXT  
+- Questions file (required) → Plain text  
 
-## Railway Deployment
+3. **Voilà!**  
+- AI processes the queries  
+- Generates insights + summaries  
+- Builds neat visualizations  
 
-This app is configured for Railway deployment:
+---
 
-1. **Connect to Railway**:
-   - Go to [Railway](https://railway.app)
-   - Connect your GitHub repository
-   - Select this repository
+## 🛠 Tech Behind the Scenes  
 
-2. **Set Environment Variables**:
-   - Add all required API keys in Railway dashboard
-   - Railway will automatically detect the Python app
+### Backend  
+- FastAPI ⚡ → High-performance web server  
+- LangChain 🧠 → Orchestrates LLM interactions  
+- Google Generative AI ✨ → Core AI engine  
+- Pandas + NumPy 📊 → Data wrangling made smooth  
+- Seaborn + Matplotlib 🎨 → Clean, insightful charts  
 
-3. **Deploy**:
-   - Railway will automatically build and deploy
-   - Your app will be available at the generated Railway URL
+### Frontend  
+- HTML5 + CSS + JavaScript  
+- Bootstrap-inspired modern UI  
 
-## Models Used
+---
 
-- **Gemini 2.0 Flash**: Fast data extraction and task breaking
-- **Gemini 2.5 Pro**: Advanced code generation and fixing
-- **GPT-4o Mini**: Cost-effective text generation
-- **Horizon Beta**: Alternative model via OpenRouter
+## 🔧 API Blueprint  
 
-## API Endpoints
+| Method | Endpoint  | Purpose |
+|--------|-----------|----------|
+| `GET`  | `/`       | Access web app |
+| `POST` | `/api`    | Submit dataset + questions |
+| `GET`  | `/summary`| App diagnostics & summaries |
 
-- `GET /`: Health check
-- `POST /analyze`: Main data analysis endpoint
-- `POST /upload`: File upload and processing
-- `GET /docs`: Interactive API documentation
+---
 
-## Tech Stack
+## 📂 File Support  
 
-- **FastAPI**: Modern web framework
-- **Playwright**: Web scraping
-- **Pandas/NumPy**: Data processing
-- **DuckDB**: Fast analytical database
-- **Matplotlib/Seaborn**: Data visualization
-- **Multiple LLMs**: AI-powered analysis
+| Format | Extensions |
+|--------|------------|
+| CSV    | `.csv`     |
+| Excel  | `.xlsx`, `.xls` |
+| JSON   | `.json`    |
+| Parquet| `.parquet` |
+| Text   | `.txt`     |
 
-## License
+---
 
-See LICENSE file for details.
+## 🎯 Where Can You Use This?  
+
+- 📈 Business Strategy – Sales, KPIs, forecasts  
+- 🔬 Research – Data exploration, hypothesis validation  
+- 🤖 Data Science – Quick EDA, anomaly detection  
+- 📊 Reporting – Automated dashboards  
+
+---
+
+## 🔒 Security First  
+- ✅ No cloud storage → All data stays local  
+- ✅ API keys kept safe via `.env`  
+- ✅ Configurable CORS policy for production use  
+
+---
+
+## 📜 License  
+
+Licensed under **MIT** – free for personal & commercial use. 
+
+
+
+
+
+  

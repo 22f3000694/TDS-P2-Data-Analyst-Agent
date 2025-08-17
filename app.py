@@ -1,2092 +1,1119 @@
-from fastapi import FastAPI, UploadFile, File, Request, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from matplotlib.style import context
-import uvicorn
-import base64
-import httpx
-from bs4 import BeautifulSoup
-import time
-import subprocess
-import json
-from dotenv import load_dotenv
 import os
-import data_scrape
-import functools
+import networkx as nx
 import re
+import json
+import base64
+import tempfile
+import sys
 import pandas as pd
 import numpy as np
-from io import StringIO
-from urllib.parse import urlparse
-import duckdb
-import glob
-import tabula
-import tarfile
-import zipfile
-import tempfile
-import shutil
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
 import os
+import re
+import json
+import base64
+import tempfile
+import subprocess
+import logging
+from io import BytesIO
+from typing import Dict, Any, List
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI
+from dotenv import load_dotenv
 
-app = FastAPI()
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Optional image conversion
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+# LangChain / LLM imports (keep as you used)
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+
 load_dotenv()
-# --- Cross-platform temp directory setup ---
-# The code below assumes a Unix-style /tmp directory. On Windows this usually
-# does not exist, leading to FileNotFoundError when attempting to write files
-# like /tmp/broken_down_tasks.txt. We proactively create it when running on
-# Windows so existing path literals continue to work without a large refactor.
-if os.name == "nt":
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="TDS Data Analyst Agent")
+
+# -------------------- Robust Gemini LLM with fallback --------------------
+from collections import defaultdict
+import time
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Config
+GEMINI_KEYS = [os.getenv(f"gemini_api_{i}") for i in range(1, 11)]
+GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
+
+MODEL_HIERARCHY = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite"
+]
+
+MAX_RETRIES_PER_KEY = 2
+TIMEOUT = 30
+QUOTA_KEYWORDS = ["quota", "exceeded", "rate limit", "403", "too many requests"]
+
+if not GEMINI_KEYS:
+    raise RuntimeError("No Gemini API keys found. Please set them in your environment.")
+
+# -------------------- LLM wrapper --------------------
+class LLMWithFallback:
+    def __init__(self, keys=None, models=None, temperature=0):
+        self.keys = keys or GEMINI_KEYS
+        self.models = models or MODEL_HIERARCHY
+        self.temperature = temperature
+        self.slow_keys_log = defaultdict(list)
+        self.failing_keys_log = defaultdict(int)
+        self.current_llm = None  # placeholder for actual ChatGoogleGenerativeAI instance
+
+    def _get_llm_instance(self):
+        last_error = None
+        for model in self.models:
+            for key in self.keys:
+                try:
+                    llm_instance = ChatGoogleGenerativeAI(
+                        model=model,
+                        temperature=self.temperature,
+                        google_api_key=key
+                    )
+                    self.current_llm = llm_instance
+                    return llm_instance
+                except Exception as e:
+                    last_error = e
+                    msg = str(e).lower()
+                    if any(qk in msg for qk in QUOTA_KEYWORDS):
+                        self.slow_keys_log[key].append(model)
+                    self.failing_keys_log[key] += 1
+                    time.sleep(0.5)
+        raise RuntimeError(f"All models/keys failed. Last error: {last_error}")
+
+    # Required by LangChain agent
+    def bind_tools(self, tools):
+        llm_instance = self._get_llm_instance()
+        return llm_instance.bind_tools(tools)
+
+    # Keep .invoke interface
+    def invoke(self, prompt):
+        llm_instance = self._get_llm_instance()
+        return llm_instance.invoke(prompt)
+
+
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 240))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main HTML interface"""
     try:
-        os.makedirs("/tmp", exist_ok=True)
+        with open("index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
+
+
+def parse_keys_and_types(raw_questions: str):
+    """
+    Parses the key/type section from the questions file.
+    Returns:
+        keys_list: list of keys in order
+        type_map: dict key -> casting function
+    """
+    import re
+    pattern = r"-\s*`([^`]+)`\s*:\s*(\w+)"
+    matches = re.findall(pattern, raw_questions)
+    type_map_def = {
+        "number": float,
+        "string": str,
+        "integer": int,
+        "int": int,
+        "float": float
+    }
+    type_map = {key: type_map_def.get(t.lower(), str) for key, t in matches}
+    keys_list = [k for k, _ in matches]
+    return keys_list, type_map
+
+
+
+
+# -----------------------------
+# Tools
+# -----------------------------
+
+@tool
+def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
+    """
+    Fetch a URL and return data as a DataFrame (supports HTML tables, CSV, Excel, Parquet, JSON, and plain text).
+    Always returns {"status": "success", "data": [...], "columns": [...]} if fetch works.
+    """
+    print(f"Scraping URL: {url}")
+    try:
+        from io import BytesIO, StringIO
+        from bs4 import BeautifulSoup
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/138.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.google.com/",
+        }
+
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        ctype = resp.headers.get("Content-Type", "").lower()
+
+        df = None
+
+        # --- CSV ---
+        if "text/csv" in ctype or url.lower().endswith(".csv"):
+            df = pd.read_csv(BytesIO(resp.content))
+
+        # --- Excel ---
+        elif any(url.lower().endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in ctype:
+            df = pd.read_excel(BytesIO(resp.content))
+
+        # --- Parquet ---
+        elif url.lower().endswith(".parquet"):
+            df = pd.read_parquet(BytesIO(resp.content))
+
+        # --- JSON ---
+        elif "application/json" in ctype or url.lower().endswith(".json"):
+            try:
+                data = resp.json()
+                df = pd.json_normalize(data)
+            except Exception:
+                df = pd.DataFrame([{"text": resp.text}])
+
+        # --- HTML / Fallback ---
+        elif "text/html" in ctype or re.search(r'/wiki/|\.org|\.com', url, re.IGNORECASE):
+            html_content = resp.text
+            # Try HTML tables first
+            try:
+                tables = pd.read_html(StringIO(html_content), flavor="bs4")
+                if tables:
+                    df = tables[0]
+            except ValueError:
+                pass
+
+            # If no table found, fallback to plain text
+            if df is None:
+                soup = BeautifulSoup(html_content, "html.parser")
+                text = soup.get_text(separator="\n", strip=True)
+                df = pd.DataFrame({"text": [text]})
+
+        # --- Unknown type fallback ---
+        else:
+            df = pd.DataFrame({"text": [resp.text]})
+
+        # --- Normalize columns ---
+        df.columns = df.columns.map(str).str.replace(r'\[.*\]', '', regex=True).str.strip()
+
+        return {
+            "status": "success",
+            "data": df.to_dict(orient="records"),
+            "columns": df.columns.tolist()
+        }
+
     except Exception as e:
-        # As a fallback, if creating C:/tmp fails (rare), we fall back to the
-        # system temp directory and set an environment variable so future
-        # improvements could switch to using it. For now, the /tmp path is
-        # created in almost all normal Windows environments (C:\tmp).
-        import tempfile
-        fallback_tmp = tempfile.mkdtemp(prefix="dataanalyst_")
-        os.environ["FALLBACK_TMP_DIR"] = fallback_tmp
-        print(f"⚠ Could not create /tmp, using fallback temp dir: {fallback_tmp}")
-# --- Precise file tracking & cleanup helpers ---
-def _snapshot_files(root: str = "/tmp") -> set[str]:
-    """Get a snapshot of all files under root as relative paths."""
-    files = set()
-    for dirpath, dirnames, filenames in os.walk(root):
-        # skip virtual envs or cache folders commonly present
-        parts = os.path.relpath(dirpath, root).split(os.sep)
-        if any(p in {".git", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache"} for p in parts):
-            continue
-        for fn in filenames:
-            rel = os.path.normpath(os.path.join(os.path.relpath(dirpath, root), fn))
-            files.add(rel)
-    return files
+        return {"status": "error", "message": str(e)}
 
-def _cleanup_created_files(files_to_delete: set[str]) -> int:
-    """Delete specific files created during this request.
-    Returns number of files deleted."""
-    deleted = 0
-    for rel_path in files_to_delete:
+
+# -----------------------------
+# Utilities for executing code safely
+# -----------------------------
+def clean_llm_output(output: str) -> Dict:
+    """
+    Extract JSON object from LLM output robustly.
+    Returns dict or {"error": "..."}
+    """
+    try:
+        if not output:
+            return {"error": "Empty LLM output"}
+        # remove triple-fence markers if present
+        s = re.sub(r"^```(?:json)?\s*", "", output.strip())
+        s = re.sub(r"\s*```$", "", s)
+        # find outermost JSON object by scanning for balanced braces
+        first = s.find("{")
+        last = s.rfind("}")
+        if first == -1 or last == -1 or last <= first:
+            return {"error": "No JSON object found in LLM output", "raw": s}
+        candidate = s[first:last+1]
         try:
-            path = os.path.normpath(rel_path)
-            # handle paths that might already be absolute
-            if not os.path.isabs(path):
-                path = os.path.join("/tmp", path) if path != "/tmp" else "/tmp"
-            if os.path.isfile(path):
-                os.remove(path)
-                deleted += 1
-                print(f"🗑️ Deleted: {path}")
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-                deleted += 1
-                print(f"🗑️ Deleted directory: {path}")
+            return json.loads(candidate)
         except Exception as e:
-            print(f"⚠️ Could not delete {rel_path}: {e}")
-    print(f"🧹 Cleanup complete: {deleted} files/directories deleted")
-    return deleted
+            # fallback: try last balanced pair scanning backwards
+            for i in range(last, first, -1):
+                cand = s[first:i+1]
+                try:
+                    return json.loads(cand)
+                except Exception:
+                    continue
+            return {"error": f"JSON parsing failed: {str(e)}", "raw": candidate}
+    except Exception as e:
+        return {"error": str(e)}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+SCRAPE_FUNC = r'''
+from typing import Dict, Any
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import re
+
+def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5
+        )
+        response.raise_for_status()
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "data": [],
+            "columns": []
+        }
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    tables = pd.read_html(response.text)
+
+    if tables:
+        df = tables[0]  # Take first table
+        df.columns = [str(c).strip() for c in df.columns]
+        
+        # Ensure all columns are unique and string
+        df.columns = [str(col) for col in df.columns]
+
+        return {
+            "status": "success",
+            "data": df.to_dict(orient="records"),
+            "columns": list(df.columns)
+        }
+    else:
+        # Fallback to plain text
+        text_data = soup.get_text(separator="\n", strip=True)
+
+        # Try to detect possible "keys" from text like Runtime, Genre, etc.
+        detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
+        df = pd.DataFrame([{}])  # start empty
+        for col in detected_cols:
+            df[col] = None
+
+        if df.empty:
+            df["text"] = [text_data]
+
+        return {
+            "status": "success",
+            "data": df.to_dict(orient="records"),
+            "columns": list(df.columns)
+        }
+'''
+
+
+def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60) -> Dict[str, Any]:
+    """
+    Write a temp python file which:
+      - provides a safe environment (imports)
+      - loads df/from pickle if provided into df and data variables
+      - defines a robust plot_to_base64() helper that ensures < 100kB (attempts resizing/conversion)
+      - executes the user code (which should populate `results` dict)
+      - prints json.dumps({"status":"success","result":results})
+    Returns dict with parsed JSON or error details.
+    """
+    # create file content
+    preamble = [
+        "import json, sys, gc",
+        "import pandas as pd, numpy as np",
+        "import matplotlib",
+        "matplotlib.use('Agg')",
+        "import matplotlib.pyplot as plt",
+        "from io import BytesIO",
+        "import base64",
+    ]
+    if PIL_AVAILABLE:
+        preamble.append("from PIL import Image")
+    # inject df if a pickle path provided
+    if injected_pickle:
+        preamble.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
+        preamble.append("data = df.to_dict(orient='records')\n")
+    else:
+        # ensure data exists so user code that references data won't break
+        preamble.append("data = globals().get('data', {})\n")
+
+    # plot_to_base64 helper that tries to reduce size under 100_000 bytes
+    helper = r'''
+def plot_to_base64(max_bytes=100000):
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+    buf.seek(0)
+    img_bytes = buf.getvalue()
+    if len(img_bytes) <= max_bytes:
+        return base64.b64encode(img_bytes).decode('ascii')
+    # try decreasing dpi/figure size iteratively
+    for dpi in [80, 60, 50, 40, 30]:
+        buf = BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=dpi)
+        buf.seek(0)
+        b = buf.getvalue()
+        if len(b) <= max_bytes:
+            return base64.b64encode(b).decode('ascii')
+    # if Pillow available, try convert to WEBP which is typically smaller
+    try:
+        from PIL import Image
+        buf = BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=40)
+        buf.seek(0)
+        im = Image.open(buf)
+        out_buf = BytesIO()
+        im.save(out_buf, format='WEBP', quality=80, method=6)
+        out_buf.seek(0)
+        ob = out_buf.getvalue()
+        if len(ob) <= max_bytes:
+            return base64.b64encode(ob).decode('ascii')
+        # try lower quality
+        out_buf = BytesIO()
+        im.save(out_buf, format='WEBP', quality=60, method=6)
+        out_buf.seek(0)
+        ob = out_buf.getvalue()
+        if len(ob) <= max_bytes:
+            return base64.b64encode(ob).decode('ascii')
+    except Exception:
+        pass
+    # as last resort return downsized PNG even if > max_bytes
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
+    buf.seek(0)
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+'''
+
+    # Build the code to write
+    script_lines = []
+    script_lines.extend(preamble)
+    script_lines.append(helper)
+    script_lines.append(SCRAPE_FUNC)
+    script_lines.append("\nresults = {}\n")
+    script_lines.append(code)
+    # ensure results printed as json
+    script_lines.append("\nprint(json.dumps({'status':'success','result':results}, default=str), flush=True)\n")
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
+    tmp.write("\n".join(script_lines))
+    tmp.flush()
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        completed = subprocess.run([sys.executable, tmp_path],
+                                   capture_output=True, text=True, timeout=timeout)
+        if completed.returncode != 0:
+            # collect stderr and stdout for debugging
+            return {"status": "error", "message": completed.stderr.strip() or completed.stdout.strip()}
+        # parse stdout as json
+        out = completed.stdout.strip()
+        try:
+            parsed = json.loads(out)
+            return parsed
+        except Exception as e:
+            return {"status": "error", "message": f"Could not parse JSON output: {str(e)}", "raw": out}
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "Execution timed out"}
+    finally:
+        try:
+            os.unlink(tmp_path)
+            if injected_pickle and os.path.exists(injected_pickle):
+                os.unlink(injected_pickle)
+        except Exception:
+            pass
+
+
+# -----------------------------
+# LLM agent setup
+# -----------------------------
+# llm = ChatGoogleGenerativeAI(
+#     model=os.getenv("GOOGLE_MODEL", "gemini-2.5-pro"),
+#     temperature=0,
+#     google_api_key=os.getenv("GOOGLE_API_KEY")
+# )
+# -------------------- Initialize LLM --------------------
+llm = LLMWithFallback(temperature=0)
+# -----------------------------
+
+# Tools list for agent (LangChain tool decorator returns metadata for the LLM)
+tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent will still produce code
+
+# Prompt: instruct agent to call the tool and output JSON only
+prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a full-stack autonomous data analyst agent.
+
+You will receive:
+- A set of **rules** for this request (these rules may differ depending on whether a dataset is uploaded or not)
+- One or more **questions**
+- An optional **dataset preview**
+
+You must:
+1. Follow the provided rules exactly.
+2. Return only a valid JSON object — no extra commentary or formatting.
+3. The JSON must contain:
+   - "questions": [ list of original question strings exactly as provided ]
+   - "code": "..." (Python code that creates a dict called `results` with each question string as a key and its computed answer as the value)
+4. Your Python code will run in a sandbox with:
+   - pandas, numpy, matplotlib available
+   - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
+5. When returning plots, always use `plot_to_base64()` to keep image sizes small.
+6. Make sure all variables are defined before use, and the code can run without any undefined references.
+"""),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+agent = create_tool_calling_agent(
+    llm=llm,
+    tools=[scrape_url_to_dataframe],  # let the agent call tools if it wants; we will also pre-process scrapes
+    prompt=prompt
 )
 
-API_KEY = os.getenv("API_KEY")
-open_ai_url = "https://aipipe.org/openai/v1/chat/completions"
-ocr_api_key = os.getenv("OCR_API_KEY")
-OCR_API_URL = "https://api.ocr.space/parse/image"
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-gemini_api = os.getenv("gemini_api")
-horizon_api = os.getenv("horizon_api")
-gemini_api_2 = os.getenv("gemini_api_2")
-grok_api = os.getenv("grok_api")
-grok_fix_api = os.getenv("grok_fix_api")
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=[scrape_url_to_dataframe],
+    verbose=True,
+    max_iterations=3,
+    early_stopping_method="generate",
+    handle_parsing_errors=True,
+    return_intermediate_steps=False
+)
 
-def make_json_serializable(obj):
-    """Convert pandas/numpy objects to JSON-serializable formats"""
-    if isinstance(obj, dict):
-        return {k: make_json_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [make_json_serializable(item) for item in obj]
-    elif isinstance(obj, (pd.Series)):
-        return make_json_serializable(obj.tolist())
-    elif isinstance(obj, pd.DataFrame):
-        return obj.to_dict('records')
-    elif isinstance(obj, (np.integer, np.int64, np.int32)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, np.float64, np.float32)):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif hasattr(obj, 'dtype') and hasattr(obj, 'name'):
-        return str(obj)
-    elif pd.api.types.is_extension_array_dtype(obj):
-        return str(obj)
-    elif str(type(obj)).startswith("<class 'pandas."):
-        return str(obj)
-    elif str(type(obj)).startswith("<class 'numpy."):
-        try:
-            return obj.item() if hasattr(obj, 'item') else str(obj)
-        except:
-            return str(obj)
-    else:
-        return obj
 
-# --- Safe file writing to avoid Windows cp1252 'charmap' UnicodeEncodeErrors ---
-def safe_write(path: str, text: str, replace: bool = True):
-    """Write text to file using UTF-8 regardless of system locale.
-    Windows default (cp1252) cannot encode characters like U+2011 (non-breaking hyphen)
-    or U+202F (narrow no-break space) sometimes produced by LLM outputs. This helper
-    forces utf-8 and optionally replaces unencodable characters.
+# -----------------------------
+# Runner: orchestrates agent -> pre-scrape inject -> execute
+# -----------------------------
+def run_agent_safely(llm_input: str) -> Dict:
     """
-    errors_policy = "replace" if replace else "strict"
-    with open(path, "w", encoding="utf-8", errors=errors_policy) as f:
-        f.write(text)
-
-# --- Archive extraction helper ---
-async def extract_archive_contents(file_upload: UploadFile, temp_dir: str) -> dict:
-    """Extract contents from TAR, ZIP, or other archive files and categorize them"""
-    extracted_files = {
-        'csv_files': [],
-        'json_files': [],
-        'pdf_files': [],
-        'html_files': [],
-        'image_files': [],
-        'txt_files': [],
-        'other_files': []
-    }
-    
-    try:
-        file_bytes = await file_upload.read()
-        filename_lower = file_upload.filename.lower() if file_upload.filename else ""
-        
-        # Create a temporary file to store the archive
-        temp_archive_path = os.path.join(temp_dir, file_upload.filename or "archive")
-        with open(temp_archive_path, "wb") as f:
-            f.write(file_bytes)
-        
-        extract_dir = os.path.join(temp_dir, "extracted")
-        os.makedirs(extract_dir, exist_ok=True)
-        
-        # Determine archive type and extract
-        if filename_lower.endswith(('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz')):
-            print(f"📦 Extracting TAR archive: {file_upload.filename}")
-            with tarfile.open(temp_archive_path, 'r:*') as tar:
-                # Security check: prevent path traversal
-                def is_within_directory(directory, target):
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    prefix = os.path.commonpath([abs_directory, abs_target])
-                    return prefix == abs_directory
-                
-                for member in tar.getmembers():
-                    if member.isfile():
-                        # Sanitize the path
-                        safe_path = os.path.join(extract_dir, os.path.basename(member.name))
-                        if is_within_directory(extract_dir, safe_path):
-                            try:
-                                member.name = os.path.basename(member.name)  # Flatten structure
-                                tar.extract(member, extract_dir)
-                                print(f"  ✅ Extracted: {member.name}")
-                            except Exception as e:
-                                print(f"  ⚠️ Failed to extract {member.name}: {e}")
-                                
-        elif filename_lower.endswith(('.zip', '.jar')):
-            print(f"📦 Extracting ZIP archive: {file_upload.filename}")
-            with zipfile.ZipFile(temp_archive_path, 'r') as zip_ref:
-                for member in zip_ref.namelist():
-                    if not member.endswith('/'):  # Skip directories
-                        # Sanitize the path and flatten structure
-                        safe_filename = os.path.basename(member)
-                        safe_path = os.path.join(extract_dir, safe_filename)
-                        try:
-                            with zip_ref.open(member) as source, open(safe_path, "wb") as target:
-                                target.write(source.read())
-                            print(f"  ✅ Extracted: {safe_filename}")
-                        except Exception as e:
-                            print(f"  ⚠️ Failed to extract {member}: {e}")
-        else:
-            print(f"❌ Unsupported archive format: {filename_lower}")
-            return extracted_files
-        
-        # Categorize extracted files
-        for filename in os.listdir(extract_dir):
-            file_path = os.path.join(extract_dir, filename)
-            if os.path.isfile(file_path):
-                filename_lower = filename.lower()
-                
-                if filename_lower.endswith('.csv'):
-                    extracted_files['csv_files'].append(file_path)
-                elif filename_lower.endswith('.json'):
-                    extracted_files['json_files'].append(file_path)
-                elif filename_lower.endswith('.pdf'):
-                    extracted_files['pdf_files'].append(file_path)
-                elif filename_lower.endswith(('.html', '.htm')):
-                    extracted_files['html_files'].append(file_path)
-                elif filename_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
-                    extracted_files['image_files'].append(file_path)
-                elif filename_lower.endswith('.txt'):
-                    extracted_files['txt_files'].append(file_path)
-                else:
-                    extracted_files['other_files'].append(file_path)
-        
-        print(f"📦 Archive extraction complete:")
-        for category, files in extracted_files.items():
-            if files:
-                print(f"  {category}: {len(files)} files")
-                
-    except Exception as e:
-        print(f"❌ Error extracting archive {file_upload.filename}: {e}")
-    
-    return extracted_files
-
-# Add caching for prompt files (with graceful fallback when missing)
-@functools.lru_cache(maxsize=10)
-def read_prompt_file(filename: str, default: str = "") -> str:
-    try:
-        with open(os.path.join("/app", filename), encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        print(f"⚠️ Prompt file not found: {filename}. Using default content.")
-        return default
-
-async def ping_gemini(question_text, relevant_context="", max_tries=3):
-    tries = 0
-    while tries < max_tries:
-        if tries % 2 != 0:
-            api_key = gemini_api
-        else:
-            api_key = gemini_api_2
-        try:
-            print(f"gemini is running {tries + 1} try")
-            headers = {
-                "Content-Type": "application/json",
-                "X-goog-api-key": api_key
-            }
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": relevant_context},
-                            {"text": question_text}
-                        ]
-                    }
-                ]
-            }
-            async with httpx.AsyncClient(timeout=60) as client:
-                response = await client.post(GEMINI_API_URL, headers=headers, json=payload)
-                response.raise_for_status()
-                return response.json()
-        except Exception as e:
-            print(f"Error during Gemini call (attempt {tries + 1}): {e}")
-            tries += 1
-            if tries < max_tries:
-                print(f"Retrying... ({max_tries - tries} attempts remaining)")
-            else:
-                print(f"All {max_tries} attempts failed for Gemini")
-    return {"error": "Gemini failed after max retries"}
-
-async def ping_chatgpt(question_text, relevant_context, max_tries=3):
-    tries = 0
-    while tries < max_tries:
-        try:
-            print(f"openai is running {tries+1} try")
-            headers = {
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": relevant_context},
-                    {"role": "user", "content": question_text}
-                ]
-            }
-            async with httpx.AsyncClient(timeout=120) as client:
-                response = await client.post(open_ai_url, headers=headers, json=payload)
-                return response.json()
-        except Exception as e:
-            print(f"Error creating payload: {e}")
-            tries += 1
-            continue
-
-
-async def ping_horizon(question_text, relevant_context="", max_tries=3):
-    tries = 0
-    while tries < max_tries:
-        try:
-            print(f"horizon is running {tries + 1} try")
-            headers = {
-                "Authorization": f"Bearer {horizon_api}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "openrouter/horizon-beta",
-                "messages": [
-                    {"role": "system", "content": relevant_context},
-                    {"role": "user", "content": question_text}
-                ]
-            }
-            async with httpx.AsyncClient(timeout=120) as client:
-                response = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json=payload
-                )
-                response.raise_for_status()
-                return response.json()
-        except Exception as e:
-            print(f"Error during Horizon call: {e}")
-            tries += 1
-    return {"error": "Horizon failed after max retries"}
-
-
-
-async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
-    """Call Gemini Pro API for code generation."""    
-    tries = 0
-    while tries < max_tries:
-        if tries % 2 == 0:
-            api_key = gemini_api
-        else:
-            api_key = gemini_api_2
-        try:
-            print(f"gemini pro is running {tries + 1} try")
-            headers = {
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": relevant_context},
-                            {"text": question_text}
-                        ]
-                    }
-                ]
-            }
-            async with httpx.AsyncClient(timeout=120) as client:
-                response = await client.post("https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent", headers=headers, json=payload)
-                print(response)
-                
-                # Check if response is successful
-                if response.status_code == 200:
-                    gemini_response = response.json()
-                    final_response = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
-                    return final_response
-                else:
-                    print(f"Gemini Pro API error: {response.status_code} - {response.text}")
-                    if response.status_code >= 500:  # Server errors, retry
-                        raise Exception(f"Server error {response.status_code}: {response.text}")
-                    else:  # Client errors, don't retry
-                        return {"error": f"Client error {response.status_code}: {response.text}"}
-                        
-        except Exception as e:
-            print(f"Error in Gemini Pro API call (attempt {tries + 1}): {e}")
-            tries += 1
-            if tries < max_tries:
-                print(f"Retrying... ({max_tries - tries} attempts remaining)")
-            else:
-                print(f"All {max_tries} attempts failed for Gemini Pro")
-                return {"error": f"Failed after {max_tries} attempts: {str(e)}"}
-
-
-
-
-
-def extract_json_from_output(output: str) -> str:
-    """Extract JSON from output that might contain extra text"""
-    output = output.strip()
-    
-    # First try to find complete JSON objects (prioritize these)
-    object_pattern = r'\{.*\}'
-    object_matches = re.findall(object_pattern, output, re.DOTALL)
-    
-    # If we find JSON objects, return the longest one (most complete)
-    if object_matches:
-        longest_match = max(object_matches, key=len)
-        return longest_match
-    
-    # Only if no objects found, look for arrays
-    array_pattern = r'\[.*\]'
-    array_matches = re.findall(array_pattern, output, re.DOTALL)
-    
-    if array_matches:
-        longest_match = max(array_matches, key=len)
-        return longest_match
-    
-    return output
-
-def is_valid_json_output(output: str) -> bool:
-    """Check if the output is valid JSON without trying to parse it"""
-    output = output.strip()
-    return (output.startswith('{') and output.endswith('}')) or (output.startswith('[') and output.endswith(']'))
-
-async def extract_all_urls_and_databases(question_text: str) -> dict:
-    """Extract all URLs for scraping and database files from the question"""
-    
-    extraction_prompt = f"""
-    Analyze this question and extract ONLY the ACTUAL DATA SOURCES needed to answer the questions:
-    
-    QUESTION: {question_text}
-    
-    CRITICAL INSTRUCTIONS:
-    1. Look for REAL, COMPLETE URLs that contain actual data (not example paths or documentation links)
-    2. Focus on data sources that are DIRECTLY needed to answer the specific questions being asked
-    3. IGNORE example paths like "year=xyz/court=xyz" - these are just structure examples, not real URLs
-    4. IGNORE reference links that are just for context (like documentation websites)
-    5. Only extract data sources that have COMPLETE, USABLE URLs/paths
-    
-    DATA SOURCE TYPES TO EXTRACT:
-    - Complete S3 URLs with wildcards (s3://bucket/path/file.parquet)
-    - Complete HTTP/HTTPS URLs to data APIs or files
-    - Working database connection strings
-    - Complete file paths that exist and are accessible
-    
-    DO NOT EXTRACT:
-    - Example file paths (containing "xyz", "example", "sample")
-    - Documentation or reference URLs that don't contain data
-    - Incomplete paths or URL fragments
-    - File structure descriptions that aren't actual URLs
-    
-    CONTEXT ANALYSIS:
-    Read the question carefully. If it mentions a specific database with a working query example, 
-    extract that. If it only shows file structure examples, don't extract those.
-    
-    Return a JSON object with:
-    {{
-        "scrape_urls": ["only URLs that need to be scraped for data to answer questions"],
-        "database_files": [
-            {{
-                "url": "complete_working_database_url_or_s3_path",
-                "format": "parquet|csv|json",
-                "description": "what data this contains that helps answer the questions"
-            }}
-        ],
-        "has_data_sources": true/false
-    }}
-    
-    EXAMPLES:
-    ✅ EXTRACT: "s3://bucket/data/file.parquet?region=us-east-1" (complete S3 URL)
-    ✅ EXTRACT: "https://api.example.com/data.csv" (working data URL)
-    ❌ IGNORE: "data/pdf/year=xyz/court=xyz/file.pdf" (example path with placeholders)
-    ❌ IGNORE: "https://documentation-site.com/" (reference link, not data)
-    
-    Be very selective - only extract what is actually needed and usable.
+    1. Run the agent_executor.invoke to get LLM output
+    2. Extract JSON, get 'code' and 'questions'
+    3. Detect scrape_url_to_dataframe("...") calls in code, run them here, pickle df and inject before exec
+    4. Execute the code in a temp file and return results mapping questions -> answers
     """
-    
-    response = await ping_gemini(extraction_prompt, "You are a data source extraction expert. Return only valid JSON.")
     try:
-        # Check if response has error
-        if "error" in response:
-            print(f"❌ Gemini API error: {response['error']}")
-            return extract_urls_with_regex(question_text)
-        
-        # Extract text from response
-        if "candidates" not in response or not response["candidates"]:
-            print("❌ No candidates in Gemini response")
-            return extract_urls_with_regex(question_text)
-        
-        response_text = response["candidates"][0]["content"]["parts"][0]["text"]
-        print(f"Raw response text: {response_text}")
-        
-        # Try to extract JSON from response (sometimes it's wrapped in markdown)
-        if "```json" in response_text:
-            json_start = response_text.find("```json") + 7
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
-        elif "```" in response_text:
-            json_start = response_text.find("```") + 3
-            json_end = response_text.rfind("```")
-            response_text = response_text[json_start:json_end].strip()
-        
-        print(f"Extracted JSON text: {response_text}")
-        return json.loads(response_text)
-        
+        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+        if not raw_out:
+            return {"error": f"Agent returned no output. Full response: {response}"}
+
+        parsed = clean_llm_output(raw_out)
+        if "error" in parsed:
+            return parsed
+
+        if not isinstance(parsed, dict) or "code" not in parsed or "questions" not in parsed:
+            return {"error": f"Invalid agent response format: {parsed}"}
+
+        code = parsed["code"]
+        questions: List[str] = parsed["questions"]
+
+        # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
+        urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
+        pickle_path = None
+        if urls:
+            # For now support only the first URL (agent may code multiple scrapes; you can extend this)
+            url = urls[0]
+            tool_resp = scrape_url_to_dataframe(url)
+            if tool_resp.get("status") != "success":
+                return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
+            # create df and pickle it
+            df = pd.DataFrame(tool_resp["data"])
+            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+            temp_pkl.close()
+            df.to_pickle(temp_pkl.name)
+            pickle_path = temp_pkl.name
+            # Make sure agent's code can reference df/data: we will inject the pickle loader in the temp script
+
+        # Execute code in temp python script
+        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
+        if exec_result.get("status") != "success":
+            return {"error": f"Execution failed: {exec_result.get('message', exec_result)}", "raw": exec_result.get("raw")}
+
+        # exec_result['result'] should be results dict
+        results_dict = exec_result.get("result", {})
+        # Map to original questions (they asked to use exact question strings)
+        output = {}
+        for q in questions:
+            output[q] = results_dict.get(q, "Answer not found")
+        return output
+
     except Exception as e:
-        print(f"URL extraction error: {e}")
-        # Fallback to regex extraction
-        return extract_urls_with_regex(question_text)
-    
+        logger.exception("run_agent_safely failed")
+        return {"error": str(e)}
 
-def extract_urls_with_regex(question_text: str) -> dict:
-    """Fallback URL extraction using regex with context awareness"""
-    scrape_urls = []
-    database_files = []
-    
-    # Find all HTTP/HTTPS URLs
-    url_pattern = r'https?://[^\s\'"<>]+'
-    urls = re.findall(url_pattern, question_text)
-    
-    for url in urls:
-        # Clean URL (remove trailing punctuation)
-        clean_url = re.sub(r'[.,;)]+$', '', url)
-        
-        # Skip example/documentation URLs that don't contain actual data
-        skip_patterns = [
-            'example.com', 'documentation', 'github.com', 'docs.', 'help.',
-            '/docs/', '/help/', '/guide/', '/tutorial/'
-        ]
-        
-        if any(pattern in clean_url.lower() for pattern in skip_patterns):
-            continue
-        
-        # Check if it's a database file
-        if any(ext in clean_url.lower() for ext in ['.parquet', '.csv', '.json']):
-            format_type = "parquet" if ".parquet" in clean_url else "csv" if ".csv" in clean_url else "json"
-            database_files.append({
-                "url": clean_url,
-                "format": format_type,
-                "description": f"Database file ({format_type})"
-            })
-        else:
-            # Only add to scrape_urls if it looks like it contains data
-            # Skip pure documentation/reference sites
-            if not any(skip in clean_url.lower() for skip in ['ecourts.gov.in']):  # Add known reference sites
-                scrape_urls.append(clean_url)
-    
-    # Find S3 paths - but only complete ones, not examples
-    s3_pattern = r's3://[^\s\'"<>]+'
-    s3_urls = re.findall(s3_pattern, question_text)
-    for s3_url in s3_urls:
-        # Skip example paths with placeholders
-        if any(placeholder in s3_url for placeholder in ['xyz', 'example', '***', 'EXAMPLE']):
-            continue
-            
-        clean_s3 = s3_url.split()[0]  # Take only the URL part
-        if '?' in clean_s3:
-            # Keep query parameters for S3 (they often contain important config)
-            pass
-        
-        database_files.append({
-            "url": clean_s3,
-            "format": "parquet",
-            "description": "S3 parquet file"
-        })
-    
-    return {
-        "scrape_urls": scrape_urls,
-        "database_files": database_files,
-        "has_data_sources": len(scrape_urls) > 0 or len(database_files) > 0
-    }
 
-async def scrape_all_urls(urls: list) -> list:
-    """Scrape all URLs and save as data1.csv, data2.csv, etc."""
-    scraped_data = []
-    sourcer = data_scrape.ImprovedWebScraper()
-    
-    for i, url in enumerate(urls):
-        try:
-            print(f"🌐 Scraping URL {i+1}/{len(urls)}: {url}")
-            
-            # Create config for web scraping
-            source_config = {
-                "source_type": "web_scrape",
-                "url": url,
-                "data_location": "Web page data",
-                "extraction_strategy": "scrape_web_table"
-            }
-            
-            # Extract data
-            result = await sourcer.extract_data(source_config)
-            
-            # Handle multiple tables
-            if "tables" in result:
-                tables = result["tables"]
-                table_names = result["metadata"].get("table_names", [])
-                
-                for j, table_data in enumerate(tables):
-                    df = table_data["dataframe"]
-                    table_name = table_data["table_name"]
-                    
-                    if not df.empty:
-                        # Create unique filename with table name and index
-                        safe_table_name = table_name.replace(" ", "_").replace("-", "_")
-                        # Remove any problematic characters for filenames
-                        safe_table_name = "".join(c for c in safe_table_name if c.isalnum() or c in ["_", "-"])
-                        
-                        if i == 0:  # First URL
-                            filename = f"{safe_table_name}_{j+1}.csv"
-                        else:  # Subsequent URLs
-                            filename = f"{safe_table_name}_url{i+1}_{j+1}.csv"
-                        
-                        df.to_csv(f"/tmp/{filename}", index=False, encoding="utf-8")
-                        
-                        scraped_data.append({
-                            "filename": f"/tmp/{filename}",
-                            "source_url": url,
-                            "table_name": table_name,
-                            "shape": table_data["shape"],
-                            "columns": table_data["columns"],
-                            "sample_data": df.head(3).to_dict('records') if not df.empty else []
-                        })
-                        
-                        print(f"💾 Saved {table_name} as {filename}")
-            
-            # Fallback for old single table format
-            elif "dataframe" in result:
-                df = result["dataframe"]
-                
-                if not df.empty:
-                    filename = f"data{i+1}.csv" if i > 0 else "data.csv"
-                    df.to_csv(f"/tmp/{filename}", index=False, encoding="utf-8")
-                    
-                    scraped_data.append({
-                        "filename": f"/tmp/{filename}",
-                        "source_url": url,
-                        "shape": df.shape,
-                        "columns": list(df.columns)
-                    })
-                
-                print(f"✅ Saved {filename}: {df.shape} rows")
+from fastapi import Request
+
+@app.post("/api")
+async def analyze_data(request: Request):
+    try:
+        form = await request.form()
+        questions_file = None
+        data_file = None
+
+        for key, val in form.items():
+            if hasattr(val, "filename") and val.filename:  # it's a file
+                fname = val.filename.lower()
+                if fname.endswith(".txt") and questions_file is None:
+                    questions_file = val
+                else:
+                    data_file = val
+
+        if not questions_file:
+            raise HTTPException(400, "Missing questions file (.txt)")
+
+        raw_questions = (await questions_file.read()).decode("utf-8")
+        keys_list, type_map = parse_keys_and_types(raw_questions)
+
+        pickle_path = None
+        df_preview = ""
+        dataset_uploaded = False
+
+        if data_file:
+            dataset_uploaded = True
+            filename = data_file.filename.lower()
+            content = await data_file.read()
+            from io import BytesIO
+
+            if filename.endswith(".csv"):
+                df = pd.read_csv(BytesIO(content))
+            elif filename.endswith((".xlsx", ".xls")):
+                df = pd.read_excel(BytesIO(content))
+            elif filename.endswith(".parquet"):
+                df = pd.read_parquet(BytesIO(content))
+            elif filename.endswith(".json"):
+                try:
+                    df = pd.read_json(BytesIO(content))
+                except ValueError:
+                    df = pd.DataFrame(json.loads(content.decode("utf-8")))
+            elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
+                try:
+                    if PIL_AVAILABLE:
+                        image = Image.open(BytesIO(content))
+                        image = image.convert("RGB")  # ensure RGB format
+                        df = pd.DataFrame({"image": [image]})
+                    else:
+                        raise HTTPException(400, "PIL not available for image processing")
+                except Exception as e:
+                    raise HTTPException(400, f"Image processing failed: {str(e)}")  
             else:
-                print(f"⚠️ No data extracted from {url}")
-                
-        except Exception as e:
-            print(f"❌ Failed to scrape {url}: {e}")
-    
-    return scraped_data
+                raise HTTPException(400, f"Unsupported data file type: {filename}")
 
-def normalize_column_names(columns):
-    """Normalize column names for consistent matching"""
-    normalized = []
-    for col in columns:
-        # Convert to string, strip whitespace, normalize case
-        normalized_col = str(col).strip().lower()
-        # Replace multiple spaces/tabs with single space
-        normalized_col = re.sub(r'\s+', ' ', normalized_col)
-        normalized.append(normalized_col)
-    return normalized
+            # Pickle for injection
+            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+            temp_pkl.close()
+            df.to_pickle(temp_pkl.name)
+            pickle_path = temp_pkl.name
 
-def columns_match(cols1, cols2, threshold=0.6):
-    """Check if two sets of columns match with some tolerance"""
-    norm_cols1 = normalize_column_names(cols1)
-    norm_cols2 = normalize_column_names(cols2)
-    
-    if len(norm_cols1) != len(norm_cols2):
-        print(f"   🔍 Column count mismatch: {len(norm_cols1)} vs {len(norm_cols2)}")
-        return False
-    
-    # Check exact match first
-    if norm_cols1 == norm_cols2:
-        print(f"   ✅ Exact column match found")
-        return True
-    
-    # Check similarity for each column pair
-    matches = 0
-    for c1, c2 in zip(norm_cols1, norm_cols2):
-        if c1 == c2:
-            matches += 1
+            df_preview = (
+                f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
+                f"Columns: {', '.join(df.columns.astype(str))}\n"
+                f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
+            )
+
+        # Build rules based on data presence
+        if dataset_uploaded:
+            llm_rules = (
+                "Rules:\n"
+                "1) You have access to a pandas DataFrame called `df` and its dictionary form `data`.\n"
+                "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
+                "3) Use only the uploaded dataset for answering questions.\n"
+                "4) Produce a final JSON object with keys:\n"
+                '   - "questions": [ ... original question strings ... ]\n'
+                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
+                "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+            )
         else:
-            # Simple similarity check (you could use more sophisticated methods)
-            if c1 and c2:  # Avoid empty strings
-                similarity = len(set(c1.split()) & set(c2.split())) / max(len(c1.split()), len(c2.split()))
-                if similarity >= threshold:
-                    matches += 1
-                    print(f"   🔍 Similar columns: '{c1}' ≈ '{c2}' (similarity: {similarity:.2f})")
-    
-    match_ratio = matches / len(norm_cols1)
-    result = match_ratio >= threshold
-    print(f"   🔍 Column match ratio: {match_ratio:.2f} (threshold: {threshold}) = {'✅ MATCH' if result else '❌ NO MATCH'}")
-    return result
+            llm_rules = (
+                "Rules:\n"
+                "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
+                "2) Produce a final JSON object with keys:\n"
+                '   - "questions": [ ... original question strings ... ]\n'
+                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
+                "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+            )
 
-async def process_pdf_files() -> list:
-    """Process all PDF files in current directory and extract tables, combining tables with same headers"""
-    pdf_data = []
-    
-    # Find all PDF files in current directory
-    pdf_files = glob.glob("/tmp/*.pdf")
-    if not pdf_files:
-        print("📄 No PDF files found in current directory")
-        return pdf_data
-    
-    print(f"📄 Found {len(pdf_files)} PDF files to process")
-    
-    all_raw_tables = []  # Store all raw tables
-    
-    # First pass: Extract ALL raw tables from ALL PDFs (no processing at all)
-    print("🔄 Phase 1: Extracting raw tables from all PDFs...")
-    for i, pdf_file in enumerate(pdf_files):
-        try:
-            print(f"📄 Processing PDF {i+1}/{len(pdf_files)}: {pdf_file}")
-            
-            # Extract all tables from PDF using tabula
+        llm_input = (
+            f"{llm_rules}\nQuestions:\n{raw_questions}\n"
+            f"{df_preview if df_preview else ''}"
+            "Respond with the JSON object only."
+        )
+
+        # Run agent
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as ex:
+            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path)
             try:
-                # Extract tables with various configurations to catch different table formats
-                tables = tabula.read_pdf(
-                    pdf_file, 
-                    pages='all', 
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,  # For tables with clear borders
-                    silent=True
-                )
-                
-                # If lattice method didn't work well, try stream method
-                if not tables or all(df.empty for df in tables):
-                    print("📄 Retrying with stream method...")
-                    tables = tabula.read_pdf(
-                        pdf_file, 
-                        pages='all', 
-                        multiple_tables=True,
-                        pandas_options={'header': 'infer'},
-                        stream=True,  # For tables without clear borders
-                        silent=True
-                    )
-                
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for {pdf_file}: {tabula_error}")
-                continue
-            
-            if not tables:
-                print(f"⚠️ No tables found in {pdf_file}")
-                continue
-            
-            print(f"📊 Found {len(tables)} raw tables in {pdf_file}")
-            
-            # Store all raw tables with metadata (NO PROCESSING)
-            for j, raw_df in enumerate(tables):
-                if raw_df.empty:
-                    print(f"⚠️ Table {j+1} is empty, skipping")
-                    continue
-                
-                table_metadata = {
-                    "raw_dataframe": raw_df,
-                    "source_pdf": pdf_file,
-                    "table_number": j + 1,
-                    "raw_columns": list(raw_df.columns)
-                }
-                
-                all_raw_tables.append(table_metadata)
-                print(f"✅ Stored raw table {j+1} from {pdf_file} ({raw_df.shape[0]} rows, {raw_df.shape[1]} cols)")
-                print(f"   📋 Columns: {list(raw_df.columns)}")
-        
-        except Exception as e:
-            print(f"❌ Failed to process PDF {pdf_file}: {e}")
-    
-    if not all_raw_tables:
-        print("❌ No tables extracted from any PDF files")
-        return pdf_data
-    
-    print(f"📊 Phase 1 complete: {len(all_raw_tables)} raw tables extracted")
-    
-    # Second pass: Group raw tables by similar headers
-    print("\n🔄 Phase 2: Grouping tables with similar headers...")
-    combined_data_groups = {}
-    
-    for table_meta in all_raw_tables:
-        columns = table_meta["raw_columns"]
-        
-        print(f"\n🔍 Analyzing table from {table_meta['source_pdf']} (table {table_meta['table_number']})")
-        print(f"   📋 Columns: {columns}")
-        
-        # Find existing group with matching headers
-        found_group = None
-        for group_key, group_data in combined_data_groups.items():
-            print(f"   🔄 Comparing with group '{group_key}':")
-            if columns_match(columns, group_data["reference_columns"]):
-                found_group = group_key
+                result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                raise HTTPException(408, "Processing timeout")
+
+        if "error" in result:
+            raise HTTPException(500, detail=result["error"])
+
+        # Post-process key mapping & type casting
+        if keys_list and type_map:
+            mapped = {}
+            for idx, q in enumerate(result.keys()):
+                if idx < len(keys_list):
+                    key = keys_list[idx]
+                    caster = type_map.get(key, str)
+                    try:
+                        val = result[q]
+                        if isinstance(val, str) and val.startswith("data:image/"):
+                            # Remove data URI prefix
+                            val = val.split(",", 1)[1] if "," in val else val
+                        mapped[key] = caster(val) if val not in (None, "") else val
+                    except Exception:
+                        mapped[key] = result[q]
+            result = mapped
+
+        return JSONResponse(content=result)
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.exception("analyze_data failed")
+        raise HTTPException(500, detail=str(e))
+
+
+def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
+    """
+    Runs the LLM agent and executes code.
+    - Retries up to 3 times if agent returns no output.
+    - If pickle_path is provided, injects that DataFrame directly.
+    - If no pickle_path, falls back to scraping when needed.
+    """
+    try:
+        max_retries = 3
+        raw_out = ""
+        for attempt in range(1, max_retries + 1):
+            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+            raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+            if raw_out:
                 break
-        
-        if found_group:
-            # Add to existing group
-            combined_data_groups[found_group]["raw_tables"].append(table_meta)
-            print(f"   ➕ Added to existing group '{found_group}' (now {len(combined_data_groups[found_group]['raw_tables'])} tables)")
-        else:
-            # Create new group
-            group_name = f"table_group_{len(combined_data_groups) + 1}"
-            combined_data_groups[group_name] = {
-                "reference_columns": columns,
-                "raw_tables": [table_meta]
-            }
-            print(f"   🆕 Created new group '{group_name}'")
-    
-    print(f"\n📊 Phase 2 complete: {len(combined_data_groups)} group(s) created")
-    for group_name, group_data in combined_data_groups.items():
-        print(f"   📁 {group_name}: {len(group_data['raw_tables'])} tables")
-        for table in group_data['raw_tables']:
-            print(f"      - {table['source_pdf']} (table {table['table_number']})")
-    
-    # Third pass: Simply merge tables and save (NO data_scrape processing)
-    print("\n🔄 Phase 3: Merging grouped tables and saving...")
-    
-    for group_name, group_data in combined_data_groups.items():
-        raw_tables_in_group = group_data["raw_tables"]
-        reference_columns = group_data["reference_columns"]
-        
-        print(f"\n🔗 Processing group '{group_name}' with {len(raw_tables_in_group)} table(s)...")
-        
-        # Merge all raw tables in this group
-        combined_raw_dfs = []
-        source_pdfs = []
-        
-        for table_meta in raw_tables_in_group:
-            raw_df = table_meta["raw_dataframe"].copy()  # Make a copy to avoid modifying original
-            
-            # Ensure column names match the reference
-            if list(raw_df.columns) != reference_columns:
-                print(f"   🔧 Standardizing columns for {table_meta['source_pdf']}")
-                raw_df.columns = reference_columns
-            
-            # Add source tracking
-            raw_df['source_pdf'] = table_meta["source_pdf"]
-            raw_df['table_number'] = table_meta["table_number"]
-            
-            combined_raw_dfs.append(raw_df)
-            source_pdfs.append(table_meta["source_pdf"])
-            print(f"   ✅ Added {raw_df.shape[0]} rows from {table_meta['source_pdf']}")
-        
-        # Combine all raw DataFrames
-        try:
-            print(f"   🔗 Merging {len(combined_raw_dfs)} raw tables...")
-            merged_df = pd.concat(combined_raw_dfs, ignore_index=True)
-            print(f"   ✅ Merged into single table: {merged_df.shape[0]} rows, {merged_df.shape[1]} cols")
-            
-            # Create a meaningful filename
-            if len(combined_data_groups) == 1:
-                # Only one type of table across all PDFs
-                csv_filename = "combined_tables.csv"
-            else:
-                # Multiple different table types
-                first_col = reference_columns[0] if reference_columns else "data"
-                clean_name = re.sub(r'[^\w\s-]', '', str(first_col)).strip()
-                clean_name = re.sub(r'[-\s]+', '_', clean_name)
-                csv_filename = f"combined_{clean_name[:20]}.csv"
-            
-            # Save the merged data directly (no processing)
-            merged_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
-            
-            table_info = {
-                "filename": f"/tmp/{csv_filename}",
-                "source_pdfs": list(set(source_pdfs)),
-                "table_count": len(raw_tables_in_group),
-                "shape": merged_df.shape,
-                "columns": list(merged_df.columns),
-                "sample_data": merged_df.head(3).to_dict('records'),
-                "description": f"Combined raw table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
-                "formatting_applied": "None - raw data preserved"
-            }
-            
-            pdf_data.append(table_info)
-            print(f"   💾 Saved merged table as {csv_filename}")
-            print(f"   📊 Final: {merged_df.shape[0]} rows, {merged_df.shape[1]} columns")
-            print(f"   📋 Sources: {', '.join(set(source_pdfs))}")
-            
-        except Exception as merge_error:
-            print(f"❌ Error merging group {group_name}: {merge_error}")
-            # Fallback: save individual tables
-            for idx, table_meta in enumerate(raw_tables_in_group):
-                raw_df = table_meta["raw_dataframe"]
-                csv_filename = f"fallback_{group_name}_table_{idx+1}.csv"
-                raw_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
-                
-                table_info = {
-                    "filename": f"/tmp/{csv_filename}",
-                    "source_pdfs": [table_meta["source_pdf"]],
-                    "table_count": 1,
-                    "shape": raw_df.shape,
-                    "columns": list(raw_df.columns),
-                    "sample_data": raw_df.head(3).to_dict('records'),
-                    "description": f"Fallback raw table from {table_meta['source_pdf']} (merge failed)",
-                    "formatting_applied": "None - raw data preserved"
-                }
-                
-                pdf_data.append(table_info)
-                print(f"💾 Saved fallback table as {csv_filename}")
-    
-    if pdf_data:
-        print(f"\n✅ Processing complete: Created {len(pdf_data)} output file(s)")
-        print(f"📊 Merged {len(all_raw_tables)} total tables from {len(pdf_files)} PDF files")
-    
-    return pdf_data
+        if not raw_out:
+            return {"error": f"Agent returned no output after {max_retries} attempts"}
 
+        parsed = clean_llm_output(raw_out)
+        if "error" in parsed:
+            return parsed
 
-async def get_database_schemas(database_files: list) -> list:
-    """Get schema and sample data from database files without loading full data"""
-    database_info = []
-    
-    # Setup DuckDB
-    conn = duckdb.connect()
-    try:
-        conn.execute("INSTALL httpfs; LOAD httpfs;")
-        conn.execute("INSTALL parquet; LOAD parquet;")
-        print("✅ DuckDB extensions loaded")
+        if "code" not in parsed or "questions" not in parsed:
+            return {"error": f"Invalid agent response: {parsed}"}
+
+        code = parsed["code"]
+        questions = parsed["questions"]
+
+        if pickle_path is None:
+            urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
+            if urls:
+                url = urls[0]
+                tool_resp = scrape_url_to_dataframe(url)
+                if tool_resp.get("status") != "success":
+                    return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
+                df = pd.DataFrame(tool_resp["data"])
+                temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+                temp_pkl.close()
+                df.to_pickle(temp_pkl.name)
+                pickle_path = temp_pkl.name
+
+        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
+        if exec_result.get("status") != "success":
+            return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
+
+        results_dict = exec_result.get("result", {})
+        return {q: results_dict.get(q, "Answer not found") for q in questions}
+
     except Exception as e:
-        print(f"Warning: Could not load DuckDB extensions: {e}")
+        logger.exception("run_agent_safely_unified failed")
+        return {"error": str(e)}
+
+
     
-    for i, db_file in enumerate(database_files):
-        try:
-            url = db_file["url"]
-            format_type = db_file["format"]
-            
-            print(f"📊 Getting schema for database {i+1}/{len(database_files)}: {url}")
-            
-            # Build lightweight FROM/SELECT SQL and schema query (no data loading)
-            if format_type == "parquet" or "parquet" in url:
-                from_clause = f"read_parquet('{url}')"
-                base_select = f"SELECT * FROM {from_clause}"
-                schema_query = f"DESCRIBE SELECT * FROM {from_clause} LIMIT 0"
-            elif format_type == "csv" or "csv" in url:
-                # Use small SAMPLE_SIZE to keep inference light
-                from_clause = f"read_csv_auto('{url}', SAMPLE_SIZE=2048)"
-                base_select = f"SELECT * FROM {from_clause}"
-                schema_query = f"DESCRIBE SELECT * FROM {from_clause} LIMIT 0"
-            elif format_type == "json" or "json" in url:
-                from_clause = f"read_json_auto('{url}')"
-                base_select = f"SELECT * FROM {from_clause}"
-                schema_query = f"DESCRIBE SELECT * FROM {from_clause} LIMIT 0"
-            else:
-                print(f"❌ Unsupported format: {format_type}")
-                continue
-            
-            # Get schema
-            schema_df = conn.execute(schema_query).fetchdf()
-            schema_info = {
-                "columns": list(schema_df['column_name']),
-                "column_types": dict(zip(schema_df['column_name'], schema_df['column_type']))
-            }
+from fastapi.responses import FileResponse, Response
+import base64, os
 
-            # Attempt to fetch a tiny sample (3 rows) for user visibility
-            sample_data = []
-            try:
-                sample_query = f"{base_select} LIMIT 3"
-                sample_df = conn.execute(sample_query).fetchdf()
-                if not sample_df.empty:
-                    # Convert to list[dict] keeping primitive types
-                    sample_data = json.loads(sample_df.head(3).to_json(orient="records"))
-            except Exception as sample_err:
-                print(f"⚠️ Could not fetch sample rows for {url}: {sample_err}")
+# 1×1 transparent PNG fallback (if favicon.ico file not present)
+_FAVICON_FALLBACK_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3n+9QAAAAASUVORK5CYII="
+)
 
-            database_info.append({
-                "filename": f"database_{i+1}",
-                "source_url": url,
-                "format": format_type,
-                "schema": schema_info,
-                "description": db_file.get("description", f"Database file ({format_type})"),
-                # Provide SQL strings to be used directly in DuckDB queries (do not execute here)
-                "access_query": base_select,  # kept for backward compatibility
-                "from_clause": from_clause,
-                "preview_limit_sql": f"{base_select} LIMIT 10",
-                "sample_data": sample_data,
-                "total_columns": len(schema_info["columns"])
-            })
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """
+    Serve favicon.ico if present in the working directory.
+    Otherwise return a tiny transparent PNG to avoid 404s.
+    """
+    path = "favicon.ico"
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/x-icon")
+    return Response(content=_FAVICON_FALLBACK_PNG, media_type="image/png")
 
-            print(f"✅ Database schema extracted: {len(schema_info['columns'])} columns; sample_rows={len(sample_data)}")
-            
-        except Exception as e:
-            print(f"❌ Failed to get schema for {db_file['url']}: {e}")
-    
-    conn.close()
-    return database_info
+@app.get("/api", include_in_schema=False)
+async def analyze_get_info():
+    """Health/info endpoint. Use POST /api for actual analysis."""
+    return JSONResponse({
+        "ok": True,
+        "message": "Server is running. Use POST /api with 'questions_file' and optional 'data_file'.",
 
-def create_data_summary(csv_data: list, 
-                        provided_csv_info: dict, 
-                        database_info: list, 
-                        pdf_data: list = None,
-                        provided_html_info: dict = None,
-                        provided_json_info: dict = None,
-                        extracted_csv_data: list = None,
-                        extracted_html_data: list = None,
-                        extracted_json_data: list = None) -> dict:
-    """Create comprehensive data summary for LLM code generation.
-    Extended to support optional provided HTML & JSON sources converted to CSV,
-    and files extracted from archives.
-    Ensures total_sources counts unique sources across categories (no double counting)."""
+    })
 
-    summary = {
-        "provided_csv": None,
-        "provided_html": None,
-        "provided_json": None,
-        "scraped_data": [],
-        "database_files": [],
-        "pdf_extracted_tables": [],
-        "extracted_from_archives": {
-            "csv_files": [],
-            "html_files": [],
-            "json_files": []
-        },
-        "total_sources": 0,
+
+
+# -----------------------------
+# System Diagnostics
+# -----------------------------
+# ---- Add these imports near other imports at top of app.py ----
+import asyncio
+import httpx
+import importlib.metadata
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from datetime import datetime, timedelta
+import socket
+import platform
+import psutil
+import shutil
+import tempfile
+import os
+import time 
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse    
+
+# ---- Configuration for diagnostics (tweak as needed) ----
+DIAG_NETWORK_TARGETS = {
+    "Google AI": "https://generativelanguage.googleapis.com",
+    "AISTUDIO": "https://aistudio.google.com/",
+    "OpenAI": "https://api.openai.com",
+    "GitHub": "https://api.github.com",
+}
+DIAG_LLM_KEY_TIMEOUT = 30  # seconds per key/model simple ping test (sync tests run in threadpool)
+DIAG_PARALLELISM = 6       # how many thread workers for sync checks
+RUN_LONGER_CHECKS = False  # Playwright/duckdb tests run only if true (they can be slow)
+
+# Use existing GEMINI_KEYS / MODEL_HIERARCHY from your app. If not defined, create empty lists.
+try:
+    _GEMINI_KEYS = GEMINI_KEYS
+    _MODEL_HIERARCHY = MODEL_HIERARCHY
+except NameError:
+    _GEMINI_KEYS = []
+    _MODEL_HIERARCHY = []
+
+# helper: iso timestamp
+def _now_iso():
+    return datetime.utcnow().isoformat() + "Z"
+
+# helper: run sync func in threadpool and return result / exception info
+_executor = ThreadPoolExecutor(max_workers=DIAG_PARALLELISM)
+async def run_in_thread(fn, *a, timeout=30, **kw):
+    loop = asyncio.get_running_loop()
+    try:
+        task = loop.run_in_executor(_executor, partial(fn, *a, **kw))
+        return await asyncio.wait_for(task, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError("timeout")
+    except Exception as e:
+        # re-raise for caller to capture stacktrace easily
+        raise
+
+# ---- Diagnostic check functions (safely return dicts) ----
+def _env_check(required=None):
+    required = required or []
+    out = {}
+    for k in required:
+        out[k] = {"present": bool(os.getenv(k)), "masked": (os.getenv(k)[:4] + "..." + os.getenv(k)[-4:]) if os.getenv(k) else None}
+    # Also include simple helpful values
+    out["GOOGLE_MODEL"] = os.getenv("GOOGLE_MODEL")
+    out["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
+    return out
+
+def _system_info():
+    info = {
+        "host": socket.gethostname(),
+        "platform": platform.system(),
+        "platform_release": platform.release(),
+        "python_version": platform.python_version(),
+        "cpu_logical_cores": psutil.cpu_count(logical=True),
+        "memory_total_gb": round(psutil.virtual_memory().total / 1024**3, 2),
     }
+    # disk free for app dir and tmp
+    try:
+        _cwd = os.getcwd()
+        info["cwd_free_gb"] = round(shutil.disk_usage(_cwd).free / 1024**3, 2)
+    except Exception:
+        info["cwd_free_gb"] = None
+    try:
+        info["tmp_free_gb"] = round(shutil.disk_usage(tempfile.gettempdir()).free / 1024**3, 2)
+    except Exception:
+        info["tmp_free_gb"] = None
+    # GPU quick probe (if torch installed)
+    try:
+        import torch
+        info["torch_installed"] = True
+        info["cuda_available"] = torch.cuda.is_available()
+        if torch.cuda.is_available():
+            info["cuda_device_name"] = torch.cuda.get_device_name(0)
+    except Exception:
+        info["torch_installed"] = False
+        info["cuda_available"] = False
+    return info
 
-    # Add provided sources if present
-    if provided_csv_info:
-        summary["provided_csv"] = provided_csv_info
-    if provided_html_info:
-        summary["provided_html"] = provided_html_info
-    if provided_json_info:
-        summary["provided_json"] = provided_json_info
+def _temp_write_test():
+    tmp = tempfile.gettempdir()
+    path = os.path.join(tmp, f"diag_test_{int(time.time())}.tmp")
+    with open(path, "w") as f:
+        f.write("ok")
+    ok = os.path.exists(path)
+    os.remove(path)
+    return {"tmp_dir": tmp, "write_ok": ok}
 
-    # Add extracted data from archives
-    if extracted_csv_data:
-        summary["extracted_from_archives"]["csv_files"] = extracted_csv_data
-    if extracted_html_data:
-        summary["extracted_from_archives"]["html_files"] = extracted_html_data
-    if extracted_json_data:
-        summary["extracted_from_archives"]["json_files"] = extracted_json_data
+def _app_write_test():
+    # try writing into current working directory
+    cwd = os.getcwd()
+    path = os.path.join(cwd, f"diag_test_{int(time.time())}.tmp")
+    with open(path, "w") as f:
+        f.write("ok")
+    ok = os.path.exists(path)
+    os.remove(path)
+    return {"cwd": cwd, "write_ok": ok}
 
-    summary["scraped_data"] = csv_data
-    summary["database_files"] = database_info
-    if pdf_data:
-        summary["pdf_extracted_tables"] = pdf_data
+def _pandas_pipeline_test():
+    import pandas as _pd
+    df = _pd.DataFrame({"x":[1,2,3], "y":[4,5,6]})
+    df["z"] = df["x"] * df["y"]
+    agg = df["z"].sum()
+    return {"rows": df.shape[0], "cols": df.shape[1], "z_sum": int(agg)}
 
-    # Compute unique total sources by identifiers (filenames/URLs)
-    identifiers = set()
-    for info in [provided_csv_info, provided_html_info, provided_json_info]:
-        if info and info.get("filename"):
-            identifiers.add(os.path.normpath(info["filename"]))
-    for item in csv_data or []:
-        fn = item.get("filename")
-        if fn:
-            identifiers.add(os.path.normpath(fn))
-    for item in database_info or []:
-        src = item.get("source_url") or item.get("filename")
-        if src:
+def _installed_packages_sample():
+    # return top 20 installed package names + versions
+    try:
+        out = []
+        for dist in importlib.metadata.distributions():
             try:
-                norm = os.path.normpath(src) if not (src.startswith("http://") or src.startswith("https://") or src.startswith("s3://")) else src
+                out.append(f"{dist.metadata['Name']}=={dist.version}")
             except Exception:
-                norm = src
-            identifiers.add(norm)
-    for item in pdf_data or []:
-        pdf_file = item.get("source_pdf")
-        if pdf_file:
-            identifiers.add(os.path.normpath(pdf_file))
-    
-    # Add extracted data from archives
-    for extracted_list in [extracted_csv_data, extracted_html_data, extracted_json_data]:
-        for item in extracted_list or []:
-            fn = item.get("filename")
-            if fn:
-                identifiers.add(os.path.normpath(fn))
-
-    summary["total_sources"] = len(identifiers)
-    return summary
-
-@app.get("/")
-async def root():
-    """Health check endpoint for Railway deployment"""
-    return {
-        "status": "healthy",
-        "message": "FastAPI Data Analyst Application is running",
-        "version": "1.0.0",
-        "endpoints": {
-            "main": "/aianalyst/",
-            "docs": "/docs",
-            "health": "/"
-        }
-    }
-
-@app.get("/health")
-async def health_check():
-    """Alternative health check endpoint"""
-    return {"status": "ok", "timestamp": "2024-01-01T00:00:00Z"}
-
-@app.post("/aianalyst/")
-async def aianalyst(request: Request):
-    # Parse form data to get all files regardless of field names
-    form = await request.form()
-    
-    # Extract all uploaded files from form data
-    uploaded_files = []
-    for field_name, field_value in form.items():
-        if hasattr(field_value, 'filename') and field_value.filename:
-            uploaded_files.append(field_value)
-    
-    print(f"📁 Received {len(uploaded_files)} files with any field names:")
-    for file in uploaded_files:
-        print(f"  📄 {file.filename} (field: {[k for k, v in form.items() if v == file][0]})")
- 
-    time_start = time.time()
-    # Track files created during this request
-    initial_snapshot = _snapshot_files("/tmp")
-    created_files: set[str] = set()
-    
-    # Initialize file type variables
-    questions_file_upload = None
-    image = None
-    pdf = None
-    csv_file = None
-    html_file = None
-    json_file = None
-    archive_files = []  # Support multiple archive files
-    
-    # Categorize files by extension (regardless of field name)
-    for file in uploaded_files:
-        if file.filename:
-            filename_lower = file.filename.lower()
-            if filename_lower.endswith('.txt'):
-                if questions_file_upload is None:  # Take first .txt file as questions
-                    questions_file_upload = file
-            elif filename_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
-                if image is None:  # Take first image file
-                    image = file
-            elif filename_lower.endswith('.pdf'):
-                if pdf is None:  # Take first PDF file
-                    pdf = file
-            elif filename_lower.endswith('.csv'):
-                if csv_file is None:  # Take first CSV file
-                    csv_file = file
-            elif filename_lower.endswith(('.html', '.htm')):
-                if html_file is None:  # Take first HTML file
-                    html_file = file
-            elif filename_lower.endswith('.json'):
-                if json_file is None:  # Take first JSON file
-                    json_file = file
-            elif filename_lower.endswith(('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.zip', '.jar')):
-                archive_files.append(file)  # Collect all archive files
-    
-    print(f"📁 File categorization complete:")
-    if questions_file_upload: print(f"  📝 Questions: {questions_file_upload.filename}")
-    if image: print(f"  🖼️ Image: {image.filename}")
-    if pdf: print(f"  📄 PDF: {pdf.filename}")
-    if csv_file: print(f"  📊 CSV: {csv_file.filename}")
-    if html_file: print(f"  🌐 HTML: {html_file.filename}")
-    if json_file: print(f"  🗂️ JSON: {json_file.filename}")
-    if archive_files: print(f"  📦 Archives: {[f.filename for f in archive_files]}")
-    
-    # Handle questions text file
-    question_text = ""
-    if questions_file_upload:
-        content = await questions_file_upload.read()
-        question_text = content.decode("utf-8")
-        print(f"📝 Questions loaded from file: {questions_file_upload.filename}")
-    else:
-        question_text = "No questions provided"
-
-    # Handle image if provided (existing logic)
-    if image:
-        try:
-            image_bytes = await image.read()
-            base64_image = base64.b64encode(image_bytes).decode("utf-8")
-            
-            if not ocr_api_key:
-                print("⚠️ OCR_API_KEY not found - skipping image processing")
-                question_text += "\n\nOCR API key not configured - image text extraction skipped"
-            else:
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                    form_data = {
-                        "base64Image": f"data:image/png;base64,{base64_image}",
-                        "apikey": ocr_api_key,
-                        "language": "eng",
-                        "scale": "true",
-                        "OCREngine": "1"
-                    }
-                    
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    }
-                    
-                    response = await client.post(OCR_API_URL, data=form_data, headers=headers)
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        if not result.get('IsErroredOnProcessing', True):
-                            parsed_results = result.get('ParsedResults', [])
-                            if parsed_results:
-                                image_text = parsed_results[0].get('ParsedText', '').strip()
-                                if image_text:
-                                    question_text += f"\n\nExtracted from image:\n{image_text}"
-                                    print("✅ Text extracted from image")
-                    else:
-                        print(f"❌ OCR API error: {response.status_code}")
-                    
-        except Exception as e:
-            print(f"❌ Error extracting text from image: {e}")
-
-    # Handle archive files (TAR, ZIP) - extract and route contents to appropriate processors
-    extracted_from_archives = {
-        'csv_files': [],
-        'json_files': [],
-        'pdf_files': [],
-        'html_files': [],
-        'image_files': [],
-        'txt_files': []
-    }
-    
-    if archive_files:
-        # Create a temporary directory for extraction
-        temp_dir = tempfile.mkdtemp(prefix="archive_extract_", dir="/tmp")
-        created_files.add(temp_dir)  # Track for cleanup
-        
-        try:
-            for archive_file in archive_files:
-                print(f"📦 Processing archive: {archive_file.filename}")
-                extracted_contents = await extract_archive_contents(archive_file, temp_dir)
-                
-                # Merge results
-                for category, files in extracted_contents.items():
-                    extracted_from_archives[category].extend(files)
-            
-            # Process extracted files and route them to existing handlers
-            # Add extracted text files to questions if any
-            for txt_file_path in extracted_from_archives['txt_files']:
                 try:
-                    with open(txt_file_path, 'r', encoding='utf-8', errors='replace') as f:
-                        extracted_text = f.read()
-                        question_text += f"\n\nExtracted from archive ({os.path.basename(txt_file_path)}):\n{extracted_text}"
-                        print(f"📝 Added text from archive: {os.path.basename(txt_file_path)}")
-                except Exception as e:
-                    print(f"⚠️ Failed to read extracted text file {txt_file_path}: {e}")
-            
-            # Process extracted images for OCR
-            for img_file_path in extracted_from_archives['image_files']:
-                if not ocr_api_key:
-                    print("⚠️ OCR_API_KEY not found - skipping extracted image processing")
+                    out.append(f"{dist.metadata['Name']}")
+                except Exception:
                     continue
-                    
-                try:
-                    with open(img_file_path, 'rb') as f:
-                        image_bytes = f.read()
-                    base64_image = base64.b64encode(image_bytes).decode("utf-8")
-                    
-                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                        form_data = {
-                            "base64Image": f"data:image/png;base64,{base64_image}",
-                            "apikey": ocr_api_key,
-                            "language": "eng",
-                            "scale": "true",
-                            "OCREngine": "1"
-                        }
-                        
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                        }
-                        
-                        response = await client.post(OCR_API_URL, data=form_data, headers=headers)
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            
-                            if not result.get('IsErroredOnProcessing', True):
-                                parsed_results = result.get('ParsedResults', [])
-                                if parsed_results:
-                                    image_text = parsed_results[0].get('ParsedText', '').strip()
-                                    if image_text:
-                                        question_text += f"\n\nExtracted from archive image ({os.path.basename(img_file_path)}):\n{image_text}"
-                                        print(f"✅ Text extracted from archive image: {os.path.basename(img_file_path)}")
-                        else:
-                            print(f"❌ OCR API error for {img_file_path}: {response.status_code}")
-                            
-                except Exception as e:
-                    print(f"❌ Error processing extracted image {img_file_path}: {e}")
-                    
-        except Exception as e:
-            print(f"❌ Error processing archive files: {e}")
-
-    # Step 3: Handle provided CSV file
-    # EARLY TASK BREAKDOWN (user request: generate first before other heavy steps)
-    # We do this after potential image OCR so the extracted text is included.
-    task_breaker_instructions = read_prompt_file(
-        "prompts/task_breaker.txt",
-        default=(
-            "You are a precise task breaker. Given a user question, output a concise, ordered list of actionable steps "
-            "to analyze the data sources provided (CSV, scraped tables, or DuckDB FROM clauses). Keep steps specific "
-            "(load data, validate schema, compute metrics, create plots, return final JSON)."
-        ),
-    )
-    try:
-        gemini_response = await ping_gemini(question_text, task_breaker_instructions)
-        task_breaked = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
+        return {"sample_packages": sorted(out)[:20]}
     except Exception as e:
-        task_breaked = f"1. Read question (Task breaker fallback due to error: {e})"  # fallback minimal content
-    with open("/tmp/broken_down_tasks.txt", "w", encoding="utf-8") as f:
-        f.write(str(task_breaked))
-    created_files.add(os.path.normpath("/tmp/broken_down_tasks.txt"))
+        return {"error": str(e)}
 
-    # Proceed with remaining steps (CSV/HTML/JSON processing, source extraction, etc.)
-    # ----------------------------------------------------------------------
-    provided_csv_info = None
-    provided_html_info = None
-    provided_json_info = None
-    if csv_file:
-        try:
-            csv_content = await csv_file.read()
-            csv_df = pd.read_csv(StringIO(csv_content.decode("utf-8")))
-            
-            # Clean the CSV
-            sourcer = data_scrape.ImprovedWebScraper()
-            cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(csv_df)
-            
-            # Save as ProvidedCSV.csv
-            cleaned_df.to_csv("/tmp/ProvidedCSV.csv", index=False, encoding="utf-8")
-            created_files.add(os.path.normpath("/tmp/ProvidedCSV.csv"))
-
-            
-            provided_csv_info = {
-                "filename": "/tmp/ProvidedCSV.csv",
-                "shape": cleaned_df.shape,
-                "columns": list(cleaned_df.columns),
-                "sample_data": cleaned_df.head(3).to_dict('records'),
-                "description": f"User-provided CSV file: {csv_file.filename} (cleaned and formatted)",
-                "formatting_applied": formatting_results
-            }
-            
-            print(f"📝 Provided CSV processed: {cleaned_df.shape} rows, saved as ProvidedCSV.csv")
-            
-        except Exception as e:
-            print(f"❌ Error processing provided CSV: {e}")
-
-    # Process extracted CSV files from archives
-    extracted_csv_data = []
-    for i, csv_file_path in enumerate(extracted_from_archives['csv_files']):
-        try:
-            print(f"📊 Processing extracted CSV {i+1}: {os.path.basename(csv_file_path)}")
-            csv_df = pd.read_csv(csv_file_path, encoding='utf-8', errors='replace')
-            
-            # Clean the CSV
-            sourcer = data_scrape.ImprovedWebScraper()
-            cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(csv_df)
-            
-            # Save with unique name
-            output_name = f"ExtractedCSV_{i+1}.csv"
-            cleaned_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
-            created_files.add(os.path.normpath(f"/tmp/{output_name}"))
-
-            csv_info = {
-                "filename": f"/tmp/{output_name}",
-                "shape": cleaned_df.shape,
-                "columns": list(cleaned_df.columns),
-                "sample_data": cleaned_df.head(3).to_dict('records'),
-                "description": f"CSV extracted from archive: {os.path.basename(csv_file_path)} (cleaned and formatted)",
-                "formatting_applied": formatting_results,
-                "source": "archive_extraction"
-            }
-            
-            extracted_csv_data.append(csv_info)
-            print(f"📝 Extracted CSV processed: {cleaned_df.shape} rows, saved as {output_name}")
-            
-        except Exception as e:
-            print(f"❌ Error processing extracted CSV {csv_file_path}: {e}")
-
-    # Handle provided HTML file (convert table to CSV via existing extraction pipeline)
-    if html_file:
-        try:
-            print("🌐 Processing uploaded HTML file...")
-            html_bytes = await html_file.read()
-            html_text = html_bytes.decode("utf-8", errors="replace")
-            sourcer = data_scrape.ImprovedWebScraper()
-            df_html = await sourcer.web_scraper.extract_table_from_html(html_text)
-            if df_html is not None and not df_html.empty:
-                cleaned_html_df, formatting_html = await sourcer.numeric_formatter.format_dataframe_numerics(df_html)
-                html_csv_name = "ProvidedHTML.csv"
-                cleaned_html_df.to_csv(f"/tmp/{html_csv_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{html_csv_name}"))
-
-                provided_html_info = {
-                    "filename": f"/tmp/{html_csv_name}",
-                    "shape": cleaned_html_df.shape,
-                    "columns": list(cleaned_html_df.columns),
-                    "sample_data": cleaned_html_df.head(3).to_dict('records'),
-                    "description": f"User-provided HTML file: {html_file.filename} (table extracted, cleaned & formatted)",
-                    "formatting_applied": formatting_html
-                }
-                print(f"📝 Provided HTML processed: {cleaned_html_df.shape} saved as {html_csv_name}")
-            else:
-                print("⚠️ No table extracted from provided HTML")
-        except Exception as e:
-            print(f"❌ Error processing provided HTML: {e}")
-
-    # Process extracted HTML files from archives
-    extracted_html_data = []
-    for i, html_file_path in enumerate(extracted_from_archives['html_files']):
-        try:
-            print(f"🌐 Processing extracted HTML {i+1}: {os.path.basename(html_file_path)}")
-            with open(html_file_path, 'r', encoding='utf-8', errors='replace') as f:
-                html_text = f.read()
-            
-            sourcer = data_scrape.ImprovedWebScraper()
-            df_html = await sourcer.web_scraper.extract_table_from_html(html_text)
-            
-            if df_html is not None and not df_html.empty:
-                cleaned_html_df, formatting_html = await sourcer.numeric_formatter.format_dataframe_numerics(df_html)
-                output_name = f"ExtractedHTML_{i+1}.csv"
-                cleaned_html_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{output_name}"))
-
-                html_info = {
-                    "filename": f"/tmp/{output_name}",
-                    "shape": cleaned_html_df.shape,
-                    "columns": list(cleaned_html_df.columns),
-                    "sample_data": cleaned_html_df.head(3).to_dict('records'),
-                    "description": f"HTML extracted from archive: {os.path.basename(html_file_path)} (table extracted, cleaned & formatted)",
-                    "formatting_applied": formatting_html,
-                    "source": "archive_extraction"
-                }
-                extracted_html_data.append(html_info)
-                print(f"📝 Extracted HTML processed: {cleaned_html_df.shape} saved as {output_name}")
-            else:
-                print(f"⚠️ No table extracted from {html_file_path}")
-        except Exception as e:
-            print(f"❌ Error processing extracted HTML {html_file_path}: {e}")
-
-    # Handle provided JSON file
-    if json_file:
-        try:
-            print("🗂️ Processing uploaded JSON file...")
-            json_bytes = await json_file.read()
-            json_text = json_bytes.decode("utf-8", errors="replace")
-            try:
-                parsed = json.loads(json_text)
-            except Exception as je:
-                print(f"❌ JSON parse error: {je}")
-                parsed = None
-            df_json = None
-            if isinstance(parsed, list):
-                # list of dicts or primitives
-                if parsed and isinstance(parsed[0], dict):
-                    df_json = pd.DataFrame(parsed)
-                else:
-                    df_json = pd.DataFrame({"value": parsed})
-            elif isinstance(parsed, dict):
-                # direct columns pattern
-                if all(isinstance(v, list) for v in parsed.values()):
-                    try:
-                        df_json = pd.DataFrame(parsed)
-                    except Exception:
-                        pass
-                # search for list of dicts inside
-                if df_json is None:
-                    candidate = None
-                    for k, v in parsed.items():
-                        if isinstance(v, list) and v and isinstance(v[0], dict):
-                            candidate = v
-                            break
-                    if candidate:
-                        df_json = pd.DataFrame(candidate)
-                # fallback single-row
-                if df_json is None:
-                    df_json = pd.DataFrame([parsed])
-            if df_json is not None and not df_json.empty:
-                sourcer = data_scrape.ImprovedWebScraper()
-                cleaned_json_df, formatting_json = await sourcer.numeric_formatter.format_dataframe_numerics(df_json)
-                json_csv_name = "ProvidedJSON.csv"
-                cleaned_json_df.to_csv(f"/tmp/{json_csv_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{json_csv_name}"))
-
-                provided_json_info = {
-                    "filename": f"/tmp/{json_csv_name}",
-                    "shape": cleaned_json_df.shape,
-                    "columns": list(cleaned_json_df.columns),
-                    "sample_data": cleaned_json_df.head(3).to_dict('records'),
-                    "description": f"User-provided JSON file: {json_file.filename} (converted, cleaned & formatted)",
-                    "formatting_applied": formatting_json
-                }
-                print(f"📝 Provided JSON processed: {cleaned_json_df.shape} saved as {json_csv_name}")
-            else:
-                print("⚠️ Could not construct DataFrame from JSON content")
-        except Exception as e:
-            print(f"❌ Error processing provided JSON: {e}")
-
-    # Process extracted JSON files from archives
-    extracted_json_data = []
-    for i, json_file_path in enumerate(extracted_from_archives['json_files']):
-        try:
-            print(f"🗂️ Processing extracted JSON {i+1}: {os.path.basename(json_file_path)}")
-            with open(json_file_path, 'r', encoding='utf-8', errors='replace') as f:
-                json_text = f.read()
-            
-            try:
-                parsed = json.loads(json_text)
-            except Exception as je:
-                print(f"❌ JSON parse error for {json_file_path}: {je}")
-                continue
-                
-            df_json = None
-            if isinstance(parsed, list):
-                # list of dicts or primitives
-                if parsed and isinstance(parsed[0], dict):
-                    df_json = pd.DataFrame(parsed)
-                else:
-                    df_json = pd.DataFrame({"value": parsed})
-            elif isinstance(parsed, dict):
-                # direct columns pattern
-                if all(isinstance(v, list) for v in parsed.values()):
-                    try:
-                        df_json = pd.DataFrame(parsed)
-                    except Exception:
-                        pass
-                # search for list of dicts inside
-                if df_json is None:
-                    candidate = None
-                    for k, v in parsed.items():
-                        if isinstance(v, list) and v and isinstance(v[0], dict):
-                            candidate = v
-                            break
-                    if candidate:
-                        df_json = pd.DataFrame(candidate)
-                # fallback single-row
-                if df_json is None:
-                    df_json = pd.DataFrame([parsed])
-                    
-            if df_json is not None and not df_json.empty:
-                sourcer = data_scrape.ImprovedWebScraper()
-                cleaned_json_df, formatting_json = await sourcer.numeric_formatter.format_dataframe_numerics(df_json)
-                output_name = f"ExtractedJSON_{i+1}.csv"
-                cleaned_json_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{output_name}"))
-
-                json_info = {
-                    "filename": f"/tmp/{output_name}",
-                    "shape": cleaned_json_df.shape,
-                    "columns": list(cleaned_json_df.columns),
-                    "sample_data": cleaned_json_df.head(3).to_dict('records'),
-                    "description": f"JSON extracted from archive: {os.path.basename(json_file_path)} (converted, cleaned & formatted)",
-                    "formatting_applied": formatting_json,
-                    "source": "archive_extraction"
-                }
-                extracted_json_data.append(json_info)
-                print(f"📝 Extracted JSON processed: {cleaned_json_df.shape} saved as {output_name}")
-            else:
-                print(f"⚠️ Could not construct DataFrame from extracted JSON {json_file_path}")
-        except Exception as e:
-            print(f"❌ Error processing extracted JSON {json_file_path}: {e}")
-
-    # Step 3.5: Handle provided PDF file
-    uploaded_pdf_data = []
-    if pdf:
-        try:
-            print("📄 Processing uploaded PDF file...")
-            pdf_content = await pdf.read()
-            
-            # Save uploaded PDF temporarily
-            temp_pdf_filename = f"uploaded_{pdf.filename}" if pdf.filename else "uploaded_file.pdf"
-            with open(f"/tmp/{temp_pdf_filename}", "wb") as f:
-                f.write(pdf_content)
-            created_files.add(os.path.normpath(f"/tmp/{temp_pdf_filename}"))                                                                                            
-            
-            print(f"📄 Saved uploaded PDF as {temp_pdf_filename}")
-
-            # Extract tables (raw) then group & merge by header before any CSV creation
-            try:
-                tables = tabula.read_pdf(
-                f"/tmp/{temp_pdf_filename}",
-                pages='all',
-                multiple_tables=True,
-                pandas_options={'header': 'infer'},
-                lattice=True,
-                silent=True
-            )
-                if not tables or all(df.empty for df in tables):
-                    print("📄 Retrying with stream method...")
-                    tables = tabula.read_pdf(
-                        f"/tmp/{temp_pdf_filename}",
-                        pages='all',
-                        multiple_tables=True,
-                        pandas_options={'header': 'infer'},
-                        stream=True,
-                        silent=True
-                    )
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for uploaded PDF: {tabula_error}")
-                tables = []
-
-            if not tables:
-                print("⚠️ No tables found in uploaded PDF")
-            else:
-                print(f"📊 Found {len(tables)} raw tables (pages) in uploaded PDF – grouping by header before saving")
-                raw_tables = []
-                for j, raw_df in enumerate(tables):
-                    if raw_df.empty:
-                        print(f"⏭️ Skipping empty table {j+1}")
-                        continue
-                    raw_tables.append({
-                        "dataframe": raw_df,
-                        "table_number": j + 1,
-                        "columns": list(raw_df.columns)
-                    })
-
-                # Group by similar headers
-                groups = []
-                for tbl in raw_tables:
-                    placed = False
-                    for grp in groups:
-                        if columns_match(tbl["columns"], grp["reference_columns"]):
-                            grp["tables"].append(tbl)
-                            placed = True
-                            break
-                    if not placed:
-                        groups.append({
-                            "reference_columns": tbl["columns"],
-                            "tables": [tbl]
-                        })
-                print(f"📦 Created {len(groups)} header group(s) from uploaded PDF")
-
-                sourcer = data_scrape.ImprovedWebScraper()
-                single_group = len(groups) == 1
-                base_name = os.path.splitext(temp_pdf_filename)[0]
-
-                for g_idx, grp in enumerate(groups, start=1):
-                    merged_df = pd.concat([t["dataframe"].copy() for t in grp["tables"]], ignore_index=True)
-                    print(f"🔗 Group {g_idx}: merged {len(grp['tables'])} page tables into {merged_df.shape[0]} rows")
-                    try:
-                        cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(merged_df)
-                    except Exception as fmt_err:
-                        print(f"⚠️ Numeric formatting failed for group {g_idx}: {fmt_err}; using raw merged data")
-                        cleaned_df = merged_df
-                        formatting_results = {}
-
-                    if single_group:
-                        csv_filename = "data.csv"
-                    else:
-                        first_col = grp["reference_columns"][0] if grp["reference_columns"] else f"group_{g_idx}"
-                        safe_part = re.sub(r'[^A-Za-z0-9_]+', '_', str(first_col))[:20]
-                        csv_filename = f"{base_name}_{safe_part or 'group'}_{g_idx}.csv"
-
-                    cleaned_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
-                    created_files.add(os.path.normpath(f"/tmp/{csv_filename}"))
-                    table_info = {
-                        "filename": f"/tmp/{csv_filename}",  # Add this
-                        "source_pdf": f"/tmp/{temp_pdf_filename}",
-                        "table_number": g_idx,
-                        "merged_from_tables": [t["table_number"] for t in grp["tables"]],
-                        "page_table_count": len(grp["tables"]),
-                        "shape": cleaned_df.shape,
-                        "columns": list(cleaned_df.columns),
-                        "sample_data": cleaned_df.head(3).to_dict('records'),
-                        "description": f"Merged table from uploaded PDF (group {g_idx}) combining {len(grp['tables'])} page tables with identical/compatible headers",
-                        "formatting_applied": formatting_results
-                    }
-                    uploaded_pdf_data.append(table_info)
-                    print(f"💾 Saved merged group {g_idx} as {csv_filename}")
-        except Exception as e:
-            print(f"❌ Error processing uploaded PDF: {e}")
-
-    # Process extracted PDF files from archives
-    extracted_pdf_data = []
-    for i, pdf_file_path in enumerate(extracted_from_archives['pdf_files']):
-        try:
-            print(f"📄 Processing extracted PDF {i+1}: {os.path.basename(pdf_file_path)}")
-            
-            # Extract tables from the PDF
-            try:
-                tables = tabula.read_pdf(
-                    pdf_file_path,
-                    pages='all',
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,
-                    silent=True
-                )
-                if not tables or all(df.empty for df in tables):
-                    print(f"📄 Retrying with stream method for {os.path.basename(pdf_file_path)}...")
-                    tables = tabula.read_pdf(
-                        pdf_file_path,
-                        pages='all',
-                        multiple_tables=True,
-                        pandas_options={'header': 'infer'},
-                        stream=True,
-                        silent=True
-                    )
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for {pdf_file_path}: {tabula_error}")
-                tables = []
-
-            if not tables:
-                print(f"⚠️ No tables found in extracted PDF {os.path.basename(pdf_file_path)}")
-                continue
-                
-            print(f"📊 Found {len(tables)} raw tables in extracted PDF – processing...")
-            
-            # Group tables by similar headers (simplified version)
-            base_name = os.path.splitext(os.path.basename(pdf_file_path))[0]
-            sourcer = data_scrape.ImprovedWebScraper()
-            
-            for j, raw_df in enumerate(tables):
-                if raw_df.empty:
-                    continue
-                    
-                try:
-                    cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(raw_df)
-                except Exception as fmt_err:
-                    print(f"⚠️ Numeric formatting failed for table {j+1}: {fmt_err}; using raw data")
-                    cleaned_df = raw_df
-                    formatting_results = {}
-
-                csv_filename = f"ExtractedPDF_{i+1}_table_{j+1}.csv"
-                cleaned_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{csv_filename}"))
-
-                table_info = {
-                    "filename": f"/tmp/{csv_filename}",
-                    "source_pdf": pdf_file_path,
-                    "table_number": j + 1,
-                    "shape": cleaned_df.shape,
-                    "columns": list(cleaned_df.columns),
-                    "sample_data": cleaned_df.head(3).to_dict('records'),
-                    "description": f"Table extracted from archive PDF: {os.path.basename(pdf_file_path)} (table {j+1})",
-                    "formatting_applied": formatting_results,
-                    "source": "archive_extraction"
-                }
-                extracted_pdf_data.append(table_info)
-                print(f"💾 Saved extracted PDF table as {csv_filename}")
-                
-        except Exception as e:
-            print(f"❌ Error processing extracted PDF {pdf_file_path}: {e}")
-
-    # Step 4: Extract all URLs and database files from question
-    print("🔍 Extracting all data sources from question...")
-    extracted_sources = await extract_all_urls_and_databases(question_text)
-    
-    print(f"📊 Found {len(extracted_sources.get('scrape_urls', []))} URLs to scrape")
-    print(f"📊 Found {len(extracted_sources.get('database_files', []))} database files")
-
-    # Step 5: Scrape all URLs and save as CSV files
-    scraped_data = []
-    if extracted_sources.get('scrape_urls'):
-        scraped_data = await scrape_all_urls(extracted_sources['scrape_urls'])
-        for item in scraped_data:
-            fn = item.get("filename")
-            if fn:
-                created_files.add(os.path.normpath(fn))
-
-    # Step 5.5: Process local PDF files (already merges inside helper)
-    print("📄 Processing local PDF files...")
-    local_pdf_data = await process_pdf_files()
-    for item in local_pdf_data:
-        fn = item.get("filename")
-        if fn:
-            created_files.add(os.path.normpath(fn))
-
-    # Combine uploaded, local, and extracted PDF data
-    pdf_data = uploaded_pdf_data + local_pdf_data + extracted_pdf_data
-    
-    if pdf_data:
-        print(f"📄 Total extracted tables: {len(pdf_data)} ({len(uploaded_pdf_data)} from uploaded PDF, {len(local_pdf_data)} from local PDFs, {len(extracted_pdf_data)} from archive extraction)")
-    elif uploaded_pdf_data:
-        print(f"📄 Extracted {len(uploaded_pdf_data)} tables from uploaded PDF")
-    elif local_pdf_data:
-        print(f"📄 Extracted {len(local_pdf_data)} tables from local PDF files")
-    elif extracted_pdf_data:
-        print(f"📄 Extracted {len(extracted_pdf_data)} tables from archive extraction")
-
-    # Step 6: Get database schemas and sample data
-    database_info = []
-    database_files_to_process = []
-    if provided_csv_info:
-        database_files_to_process.append({
-            "url": provided_csv_info.get("filename", "/tmp/ProvidedCSV.csv"),
-            "format": "csv",
-            "description": provided_csv_info.get("description", "User-provided CSV file (cleaned and formatted)"),
-        })
-
-    if provided_html_info:
-        database_files_to_process.append({
-            "url": provided_html_info.get("filename", "/tmp/ProvidedHTML.csv"),
-            "format": "csv",
-            "description": provided_html_info.get("description", "User-provided HTML file (cleaned and formatted)"),
-        })
-
-    if provided_json_info:
-        database_files_to_process.append({
-            "url": provided_json_info.get("filename", "/tmp/ProvidedJSON.csv"),
-            "format": "csv",
-            "description": provided_json_info.get("description", "User-provided JSON file (cleaned and formatted)"),
-        })
-
-    
-    # Add extracted files from archives to database processing
-    for csv_info in extracted_csv_data:
-        database_files_to_process.append({
-            "url": csv_info.get("filename"),
-            "format": "csv",
-            "description": csv_info.get("description", "CSV file extracted from archive"),
-        })
-    for html_info in extracted_html_data:
-        database_files_to_process.append({
-            "url": html_info.get("filename"),
-            "format": "csv",
-            "description": html_info.get("description", "HTML file extracted from archive"),
-        })
-    for json_info in extracted_json_data:
-        database_files_to_process.append({
-            "url": json_info.get("filename"),
-            "format": "csv",
-            "description": json_info.get("description", "JSON file extracted from archive"),
-        })
-    
-    extracted_db_files = extracted_sources.get('database_files', []) or []
-    def _looks_like_url(u: str) -> bool:
-        return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://") or u.startswith("s3://"))
-    for db in extracted_db_files:
-        try:
-            url = db.get("url")
-            fmt = db.get("format", "csv")
-            if not url:
-                continue
-            if _looks_like_url(url):
-                database_files_to_process.append({"url": url, "format": fmt, "description": db.get("description", f"Database file ({fmt})")})
-            else:
-                if os.path.exists(url):
-                    database_files_to_process.append({"url": url, "format": fmt, "description": db.get("description", f"Database file ({fmt})")})
-                else:
-                    print(f"⏭️ Skipping nonexistent local database file: {url}")
-        except Exception:
-            print(f"⏭️ Skipping invalid database file entry: {db}")
-    if database_files_to_process:
-        print(f"📊 Will process {len(database_files_to_process)} database files for schema extraction")
-        database_info = await get_database_schemas(database_files_to_process)
-
-    # Step 7: Create comprehensive data summary
-    data_summary = create_data_summary(
-        scraped_data, 
-        provided_csv_info, 
-        database_info, 
-        pdf_data, 
-        provided_html_info, 
-        provided_json_info,
-        extracted_csv_data,
-        extracted_html_data,
-        extracted_json_data
-    )
-    
-    # Save data summary for debugging
-    with open("/tmp/data_summary.json", "w", encoding="utf-8") as f:
-        json.dump(make_json_serializable(data_summary), f, indent=2)
-    created_files.add(os.path.normpath("/tmp/data_summary.json"))
-
-    print(f"📋 Data Summary: {data_summary['total_sources']} total sources")
-
-    # Step 8: Generate final code based on all data sources
-    # Use unified instructions that handle all source types
-    code_instructions = read_prompt_file(
-        "prompts/unified_code_instructions.txt",
-        default=(
-            "Write a single self-contained Python script that: (1) Uses only the data sources listed in DATA SUMMARY; "
-            "(2) Loads CSVs directly from local paths provided (e.g., ProvidedCSV.csv) or uses DuckDB FROM clauses "
-            "for remote sources; (3) Performs the requested computations/plots; (4) Prints ONLY a valid JSON object "
-            "to stdout via json.dumps with final results; (5) Do not access any placeholder files or URLs not in the "
-            "DATA SUMMARY; (6) Import required libraries; (7) Avoid interactive UI."
-        ),
-    )
-
-    context = (
-        "ORIGINAL QUESTION: " + question_text + "\n\n" +
-        "TASK BREAKDOWN: " + task_breaked + "\n\n" +
-        "INSTRUCTIONS: " + code_instructions + "\n\n" +
-        "DATA SUMMARY: " + json.dumps(make_json_serializable(data_summary), indent=2)
-    )
-
-    # horizon_response = await ping_horizon(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
-    # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
-    # Validate Grok response structure before trying to index
+def _network_probe_sync(url, timeout=30):
+    # synchronous network probe for threadpool use
     try:
-        raw_code =  await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
-        print(raw_code)
+        r = requests.head(url, timeout=timeout)
+        return {"ok": True, "status_code": r.status_code, "latency_ms": int(r.elapsed.total_seconds()*1000)}
     except Exception as e:
-        fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in  fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
+        return {"ok": False, "error": str(e)}
 
-        return JSONResponse(
-            content=fake_answer["choices"][0]["message"]["content"],
-            media_type="application/json"
+# ---- LLM key+model light test (sync) ----
+# tries each key for each model with a short per-call timeout (run in threadpool)
+def _test_gemini_key_model(key, model, ping_text="ping"):
+    """
+    Test a Gemini API key by sending a minimal request.
+    Always returns a pure dict with only primitive types.
+    """
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except Exception as e:
+        return {"ok": False, "error": f"langchain_google_genai import error: {e}"}
+
+    try:
+        obj = ChatGoogleGenerativeAI(
+            model=model,
+            temperature=0,
+            google_api_key=key
         )
 
-    
-    lines = raw_code.split('\n')
-    clean_lines = []
-    in_code_block = False
-
-    for line in lines:
-        if line.strip().startswith('```'):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block or (not line.strip().startswith('```') and '```' not in line):
-            clean_lines.append(line)
-
-    cleaned_code = '\n'.join(clean_lines).strip()
-
-    # Write generated code using UTF-8 to avoid Windows cp1252 encode errors (e.g. for narrow no-break space \u202f)
-    with open("/tmp/chatgpt_code.py", "w", encoding="utf-8", errors="replace") as f:
-        f.write(cleaned_code)
-    created_files.add(os.path.normpath("/tmp/chatgpt_code.py"))
-
-    # Execute the code
-    try:
-        # Snapshot before executing generated code to catch any new files it creates
-        pre_exec_snapshot = _snapshot_files("/tmp")
-        result = subprocess.run(
-            ["python", "/tmp/chatgpt_code.py"],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-
-        if result.returncode == 0:
-            stdout = result.stdout.strip()
-            json_output = extract_json_from_output(stdout)
-            
-            if is_valid_json_output(json_output):
-                try:
-                    output_data = json.loads(json_output)
-                    print("✅ Code executed successfully")
-                    
-                    # Cleanup generated files before returning
-                    post_exec_snapshot = _snapshot_files("/tmp")
-                    new_files = post_exec_snapshot - pre_exec_snapshot
-                    files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
-                    _cleanup_created_files(files_to_delete)
-                    
-                    return JSONResponse(
-                        content=output_data,
-                        media_type="application/json"
-                    )
-                except json.JSONDecodeError as e:
-                    print(f"JSON decode error: {str(e)[:100]}")
-            else:
-                print(f"Output doesn't look like JSON: {json_output[:100]}")
-        else:
-            print(f"Execution error: {result.stderr}")
-
-    except subprocess.TimeoutExpired:
-        print("Code execution timed out")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-
-    # Code fixing attempts (existing logic)
-    max_fix_attempts = 3
-    fix_attempt = 0
-    
-    while fix_attempt < max_fix_attempts:
-        fix_attempt += 1
-        print(f"🔧 Attempting to fix code (attempt {fix_attempt}/{max_fix_attempts})")
-        
-        try:
-            with open("/tmp/chatgpt_code.py", "r", encoding="utf-8") as code_file:
-                code_content = code_file.read()
-            
+        def extract_text(resp):
+            """Normalize any type of LLM response into a clean string."""
             try:
-                # Snapshot for this fix attempt
-                fix_pre_exec_snapshot = _snapshot_files("/tmp")
-                result = subprocess.run(
-                    ["python", "/tmp/chatgpt_code.py"],
-                    capture_output=True,
-                    text=True,
-                    timeout=120
-                )
-                error_context = f"Return code: {result.returncode}\nStderr: {result.stderr}\nStdout: {result.stdout}"
+                if resp is None:
+                    return None
+                if isinstance(resp, str):
+                    return resp
+                if hasattr(resp, "content") and isinstance(resp.content, str):
+                    return resp.content
+                if hasattr(resp, "text") and isinstance(resp.text, str):
+                    return resp.text
+                # For objects with .dict() method
+                if hasattr(resp, "dict"):
+                    try:
+                        return str(resp.dict())
+                    except Exception:
+                        pass
+                return str(resp)
             except Exception as e:
-                error_context = f"Execution failed with exception: {str(e)}"
-            
-            error_message = f"Error: {error_context}\n\nCode:\n{code_content}\n\nTask breakdown:\n{task_breaked}"
-            
-            fix_prompt = (
-                "URGENT CODE FIXING TASK: CURRENT BROKEN CODE: " + str(cleaned_code) + "\n" + 
-                "ERROR DETAILS: " + str(error_message) + "\n" +
-                "AVAILABLE DATA (use these exact sources): " + str(data_summary) + "\n\n" +
-                "FIXING INSTRUCTIONS:\n" +
-                "1. Fix the specific error mentioned above\n" +
-                "2. Use ONLY the data sources listed in AVAILABLE DATA section\n" +
-                "3. DO NOT add placeholder URLs or fake data\n" +
-                "Instead:\n" +
-                "                    Use DATEDIFF('day', start_date, end_date) for number of days.\n" +
-                "\n" +
-                "                    Or use date_part() only on actual DATE/TIMESTAMP/INTERVAL types.\n" +
-                "\n" +
-                "                    Always check the DuckDB function signature before applying a function.\n" +
-                "                    If a function call results in a type mismatch, either cast to the required type or choose an alternative function that directly returns the needed value."
-                "4. DO NOT create imaginary answers - process actual data\n" +
-                "5. Ensure final output is valid JSON using json.dumps()\n" +
-                "6. Make the code complete and executable\n\n"  +
-                "COMMON FIXES NEEDED:\n" +
-                "- Replace placeholder URLs with actual ones from data_summary\n" +
-                "- Fix file path references to match available files\n" +
-                "- Add missing imports\n" +
-                "- Fix syntax errors\n" +
-                "- Ensure proper JSON output format\n\n" +
-                "Return ONLY the corrected Python code (no markdown, no explanations):"
-            )
-            # Write fix prompt safely (avoid cp1252 encoding errors on Windows)
-            safe_write("/tmp/fix.txt", fix_prompt)
+                return f"[unreadable response: {e}]"
 
-            # horizon_fix = await ping_horizon(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            # fixed_code = horizon_fix["choices"][0]["message"]["content"]
+        # First try invoke()
+        try:
+            resp = obj.invoke(ping_text)
+            text = extract_text(resp)
+            return {"ok": True, "model": model, "summary": text[:200] if text else None}
+        except Exception as e_invoke:
+            # Try __call__()
+            try:
+                resp = obj.__call__(ping_text)
+                text = extract_text(resp)
+                return {"ok": True, "model": model, "summary": text[:200] if text else None}
+            except Exception as e_call:
+                return {"ok": False, "error": f"invoke failed: {e_invoke}; call failed: {e_call}"}
 
+    except Exception as e_outer:
+        return {"ok": False, "error": str(e_outer)}
 
-            # gemini_fix = await ping_chatgpt(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            # fixed_code = gemini_fix["choices"][0]["message"]["content"]
+# ---- Async wrappers that call the sync checks in threadpool ----
+async def check_network():
+    coros = []
+    for name, url in DIAG_NETWORK_TARGETS.items():
+        coros.append(run_in_thread(_network_probe_sync, url, timeout=30))
+    results = await asyncio.gather(*[asyncio.create_task(c) for c in coros], return_exceptions=True)
+    out = {}
+    for (name, _), res in zip(DIAG_NETWORK_TARGETS.items(), results):
+        if isinstance(res, Exception):
+            out[name] = {"ok": False, "error": str(res)}
+        else:
+            out[name] = res
+    return out
 
+async def check_llm_keys_models():
+    """Try all GEMINI_KEYS on each model (light-touch). Runs in threadpool with per-key timeout."""
+    if not _GEMINI_KEYS:
+        return {"warning": "no GEMINI_KEYS configured"}
 
-            gemini_fix = await ping_gemini_pro(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            fixed_code = gemini_fix
-
-
-            # Clean the fixed code
-            lines = fixed_code.split('\n')
-            clean_lines = []
-            in_code_block = False
-
-            for line in lines:
-                if line.strip().startswith('```'):
-                    in_code_block = not in_code_block
-                    continue
-                if in_code_block or (not line.strip().startswith('```') and '```' not in line):
-                    clean_lines.append(line)
-
-            cleaned_fixed_code = '\n'.join(clean_lines).strip()
-            
-            with open("/tmp/chatgpt_code.py", "w", encoding="utf-8") as code_file:
-                code_file.write(cleaned_fixed_code)
-            created_files.add(os.path.normpath("/tmp/chatgpt_code.py"))
-
-            # Test the fixed code
-            # Track any new files produced by retries as well
-            result = subprocess.run(
-                ["python", "/tmp/chatgpt_code.py"],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-
-            if result.returncode == 0:
-                stdout = result.stdout.strip()
-                json_output = extract_json_from_output(stdout)
-                
-                if is_valid_json_output(json_output):
-                    try:
-                        output_data = json.loads(json_output)
-                        print(f"✅ Code fixed and executed successfully on fix attempt {fix_attempt}")
-                        
-                        # Cleanup generated files before returning
-                        post_exec_snapshot = _snapshot_files("/tmp")
-                        # Prefer fix attempt snapshot if present
-                        new_files = post_exec_snapshot - (fix_pre_exec_snapshot if 'fix_pre_exec_snapshot' in locals() else pre_exec_snapshot)
-                        files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
-                        
-                        _cleanup_created_files(files_to_delete)
-                        return JSONResponse(
-                            content=output_data,
-                            media_type="application/json"
-                        )
-                    except json.JSONDecodeError as e:
-                        print(f"JSON decode error on fix attempt {fix_attempt}: {str(e)[:100]}")
-                else:
-                    print(f"Output still doesn't look like JSON on fix attempt {fix_attempt}: {json_output[:100]}")
+    results = []
+    # we will stop early if we find a working combo but still record attempts
+    for model in (_MODEL_HIERARCHY or ["gemini-2.5-pro"]):
+        # test keys in parallel for this model
+        tasks = []
+        for key in _GEMINI_KEYS:
+            tasks.append(run_in_thread(_test_gemini_key_model, key, model, timeout=DIAG_LLM_KEY_TIMEOUT))
+        completed = await asyncio.gather(*[asyncio.create_task(t) for t in tasks], return_exceptions=True)
+        model_summary = {"model": model, "attempts": []}
+        any_ok = False
+        for key, res in zip(_GEMINI_KEYS, completed):
+            if isinstance(res, Exception):
+                model_summary["attempts"].append({"key_mask": (key[:4] + "..." + key[-4:]) if key else None, "ok": False, "error": str(res)})
             else:
-                print(f"Execution still failing on fix attempt {fix_attempt}: {result.stderr}")
+                # res is dict returned by _test_gemini_key_model
+                model_summary["attempts"].append({"key_mask": (key[:4] + "..." + key[-4:]) if key else None, **res})
+                if res.get("ok"):
+                    any_ok = True
+        results.append(model_summary)
+        if any_ok:
+            # stop once first model has a working key (respecting MODEL_HIERARCHY)
+            break
+    return {"models_tested": results}
 
-        except subprocess.TimeoutExpired:
-            print(f"Code execution timed out on fix attempt {fix_attempt}")
+# ---- Optional slow heavy checks (DuckDB, Playwright) ----
+async def check_duckdb():
+    try:
+        import duckdb
+        def duck_check():
+            conn = duckdb.connect(":memory:")
+            conn.execute("SELECT 1")
+            conn.close()
+            return {"duckdb": True}
+        return await run_in_thread(duck_check, timeout=30)
+    except Exception as e:
+        return {"duckdb_error": str(e)}
+
+async def check_playwright():
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            b = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = await b.new_page()
+            await page.goto("about:blank")
+            ua = await page.evaluate("() => navigator.userAgent")
+            await b.close()
+            return {"playwright_ok": True, "ua": ua[:200]}
+    except Exception as e:
+        return {"playwright_error": str(e)}
+
+# ---- Final /diagnose route (concurrent) ----
+from fastapi import Query
+
+@app.get("/summary")
+async def diagnose(full: bool = Query(False, description="If true, run extended checks (duckdb/playwright)")):
+    started = datetime.utcnow()
+    report = {
+        "status": "ok",
+        "server_time": _now_iso(),
+        "summary": {},
+        "checks": {},
+        "elapsed_seconds": None
+    }
+
+    # prepare tasks
+    tasks = {
+        "env": run_in_thread(_env_check, ["GOOGLE_API_KEY", "GOOGLE_MODEL", "LLM_TIMEOUT_SECONDS"], timeout=3),
+        "system": run_in_thread(_system_info, timeout=30),
+        "tmp_write": run_in_thread(_temp_write_test, timeout=30),
+        "cwd_write": run_in_thread(_app_write_test, timeout=30),
+        "pandas": run_in_thread(_pandas_pipeline_test, timeout=30),
+        "packages": run_in_thread(_installed_packages_sample, timeout=50),
+        "network": asyncio.create_task(check_network()),
+        "llm_keys_models": asyncio.create_task(check_llm_keys_models())
+    }
+
+    if full or RUN_LONGER_CHECKS:
+        tasks["duckdb"] = asyncio.create_task(check_duckdb())
+        tasks["playwright"] = asyncio.create_task(check_playwright())
+
+    # run all concurrently, collect results
+    results = {}
+    for name, coro in tasks.items():
+        try:
+            res = await coro
+            results[name] = {"status": "ok", "result": res}
+        except TimeoutError:
+            results[name] = {"status": "timeout", "error": "check timed out"}
         except Exception as e:
-            print(f"Unexpected error on fix attempt {fix_attempt}: {e}")
+            results[name] = {"status": "error", "error": str(e), "trace": traceback.format_exc()}
 
-    # If all attempts fail
-    print("❌ All code execution attempts failed")
-    
-    # Cleanup generated files before returning error
-    final_snapshot = _snapshot_files("/tmp")
-    new_files = final_snapshot - initial_snapshot
-    files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
-    fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in application/json fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
-    _cleanup_created_files(files_to_delete)
+    report["checks"] = results
 
-    return JSONResponse(
-        content=fake_answer["choices"][0]["message"]["content"],
-        media_type="application/json"
-    )
+    # quick summary flags
+    failed = [k for k, v in results.items() if v.get("status") != "ok"]
+    if failed:
+        report["status"] = "warning"
+        report["summary"]["failed_checks"] = failed
+    else:
+        report["status"] = "ok"
+        report["summary"]["failed_checks"] = []
 
-
+    report["elapsed_seconds"] = (datetime.utcnow() - started).total_seconds()
+    return report
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
